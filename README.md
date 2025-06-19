@@ -1,119 +1,175 @@
 # Blender2ARF Exporter
 
-A Blender add-on for exporting 3D avatars to the Avatar Representation Format (ARF) as specified in ISO/IEC 23090-39:2025.
+A Blender add-on that exports 3D avatars to the Avatar Representation Format (ARF) as specified in ISO/IEC 23090-39:2025. This exporter enables creators to export complex avatars with full support for meshes, skeletons, blendshapes, skin weights, and XR tracking mappings.
 
 ## Features
 
-- **Complete ARF Compliance**: Exports avatars in full compliance with the ARF specification
-- **Multi-Asset Support**: Handles complex avatars with multiple meshes, clothing, and accessories
-- **Tensor Weight Export**: Efficient storage of skin weights using binary tensor format
-- **LOD Generation**: Automatic Level-of-Detail creation for optimized rendering
-- **Blendshape Export**: Full support for facial expressions and morph targets
-- **Animation Support**: Export skeleton-based animations (in development)
-- **XR Mapping**: Automatic mapping to OpenXR standards for face and body tracking
-- **Metadata Support**: Comprehensive avatar metadata including demographics and biometrics
+### Core Export Capabilities
+- **Multi-mesh avatars**: Export complete avatars with body, clothing, accessories, and props
+- **Skeletal animation**: Full armature/skeleton export with joint hierarchy
+- **Blendshapes**: Export all shape keys as individual GLB files for facial expressions
+- **Skin weights**: Efficient binary tensor format for vertex weights (float16 precision)
+- **Level of Detail (LOD)**: Automatic generation of reduced-polygon versions
+
+### ARF Compliance
+- Generates fully compliant ARF containers (ZIP format)
+- Creates proper ARF manifest (arf.json) with all required sections
+- Organizes assets by type (meshes, blendshapes, data, lods)
+- Automatic ID generation and cross-referencing
+- Metadata support for avatar demographics
+
+### XR Integration
+- **Face Tracking**: Automatic mapping of blendshapes to OpenXR Face Tracking v2 standard
+  - 50+ facial expression mappings
+  - URN: `urn:khronos:openxr:facial-animation:fb-tracking2`
+- **Body Tracking**: Automatic mapping of skeleton joints to OpenXR Body Tracking standard
+  - 53 body joint mappings including fingers
+  - URN: `urn:khronos:openxr:body-tracking:fb-body`
 
 ## Installation
 
-1. Download the `blender2arf` folder
-2. In Blender, go to Edit → Preferences → Add-ons
-3. Click "Install..." and select the `arf_blender_export.py` file
-4. Enable the "Avatar Representation Format (ARF) Exporter" add-on
+### Method 1: Install as Blender Add-on (Recommended)
+1. Download the `arf_blender_export.py` file
+2. Open Blender and go to Edit → Preferences → Add-ons
+3. Click "Install..." and select the downloaded file
+4. Enable "Import-Export: ARF (Avatar Representation Format) Exporter"
+
+### Method 2: Script Installation
+1. Clone or download this repository
+2. Copy the `blender2arf` folder to your Blender scripts directory:
+   - Windows: `%APPDATA%\Blender Foundation\Blender\[version]\scripts\addons\`
+   - macOS: `/Users/[user]/Library/Application Support/Blender/[version]/scripts/addons/`
+   - Linux: `~/.config/blender/[version]/scripts/addons/`
+
+### Requirements
+- Blender 2.80 or higher
+- Python 3.7+ (included with Blender)
+- NumPy (included with Blender)
 
 ## Usage
 
 ### GUI Export
-
-1. Select the objects you want to export (meshes and/or armatures)
+1. Select the objects to export (meshes and/or armatures)
 2. Go to File → Export → Avatar Representation Format (.zip)
-3. Configure export settings:
-   - **Scale**: Export scale factor (default: 1.0)
-   - **Export Animations**: Include animations from armatures
-   - **Export Blendshapes**: Include shape keys as blendshapes
-   - **Export Skeletons**: Include armature data
-   - **Export LODs**: Generate Level-of-Detail meshes
-   - **Tensor Weights**: Use efficient binary format for skin weights
-   - **Create Face/Body Mapping**: Auto-generate XR tracking mappings
+3. Configure settings in the export panel
 4. Click "Export ARF"
 
 ### Command Line Export
-
 ```bash
-blender -b your_file.blend -P path/to/arf_blender_export.py -- --output output.zip [options]
+blender -b your_avatar.blend -P arf_blender_export.py -- --output avatar.zip
 ```
 
 Options:
-- `--output`: Output ZIP file path (required)
-- `--scale`: Export scale factor (default: 1.0)
+- `--output PATH`: Output ZIP file path (required)
+- `--scale FLOAT`: Scale factor (default: 1.0)
 - `--no-animations`: Disable animation export
 - `--no-blendshapes`: Disable blendshape export
 - `--no-skeletons`: Disable skeleton export
 - `--no-lods`: Disable LOD generation
-- `--no-tensor-weights`: Use GLB format for weights instead of tensors
+- `--no-tensor-weights`: Use GLB format instead of tensor weights
 - `--debug`: Enable debug output
 
-## ARF Structure
-
-The exporter creates a ZIP container with the following structure:
-
-```
-output.zip
-├── arf.json          # ARF manifest file
-├── meshes/           # Mesh geometry files (GLB format)
-├── blendshapes/      # Blendshape files (GLB format)
-├── data/             # Binary tensor data for skin weights
-├── lods/             # Level-of-detail meshes
-└── animations/       # Animation files (when implemented)
+### Example Export Command
+```bash
+blender -b MyAvatar.blend -P arf_blender_export.py -- --output MyAvatar.zip --scale 0.01 --debug
 ```
 
-## AnimationLinks
+## Export Settings
 
-The exporter automatically creates AnimationLinks for:
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Scale | Export scale factor | 1.0 |
+| Export Animations | Include armature animations | True |
+| Export Blendshapes | Export shape keys as blendshapes | True |
+| Export Skeletons | Include armature/skeleton data | True |
+| Export LODs | Generate level-of-detail meshes | True |
+| Tensor Weights | Use binary format for skin weights | True |
+| Tensor Precision | Float precision (16 or 32 bit) | 16 |
+| Create Face Mapping | Auto-map to OpenXR face tracking | True |
+| Create Body Mapping | Auto-map to OpenXR body tracking | True |
+| Debug Mode | Enable detailed logging | False |
 
-### Face Tracking
-- Maps CC Base blendshapes to OpenXR Face Tracking v2 (XR_FB_face_tracking2)
-- Supports 50+ facial expressions
-- URN: `urn:khronos:openxr:facial-animation:fb-tracking2`
+## Output Structure
 
-### Body Tracking
-- Maps CC Base skeleton to OpenXR Body Tracking (XR_FB_body_tracking)
-- Supports full body including fingers
-- URN: `urn:khronos:openxr:body-tracking:fb-body`
+The exporter creates a ZIP file containing:
+```
+avatar.zip
+├── arf.json              # ARF manifest
+├── meshes/               # Mesh geometry (GLB files)
+│   ├── Body.glb
+│   ├── Clothing.glb
+│   └── Accessories.glb
+├── blendshapes/          # Facial expressions (GLB files)
+│   ├── Body_Smile.glb
+│   ├── Body_Frown.glb
+│   └── ...
+├── data/                 # Binary data
+│   ├── Body_skin_joints.bin
+│   ├── Body_skin_weights.bin
+│   └── ...
+└── lods/                 # Level of detail meshes
+    ├── Body_LOD2.glb
+    └── Body_LOD3.glb
+```
 
-## Requirements
+## Supported Avatar Types
 
-- Blender 2.80 or higher
-- Python 3.7+
-- NumPy (for tensor weight export)
+- **Character Creator (CC) Base**: Full support with automatic XR mappings
+- **Mixamo**: Skeleton and mesh export (manual mapping required)
+- **Daz3D**: Export supported (manual mapping required)
+- **Custom Rigs**: Any Blender armature with proper vertex groups
 
-## Development
+## TODO List
 
-### File Structure
-- `arf_blender_export.py`: Main exporter add-on
-- `blender_to_glb_simple.py`: Custom GLB exporter for mesh data
-- `README_blender.md`: Blender-specific documentation
+### High Priority
+- [ ] **Animation Export**: Implement full animation clip export to GLB format
+- [ ] **Material Export**: Properly export PBR materials and textures
+- [ ] **Texture Optimization**: Implement UV bounds calculation and texture cropping
+- [ ] **Validation**: Add pre-export validation and error reporting
+- [ ] **Progress Bar**: Show export progress for large avatars
 
-### Key Classes
-- `ExportARF`: Main export operator
-- `ARFExportSettings`: Export configuration properties
-- `organize_by_asset_type()`: Core export logic
-- `create_face_animation_link()`: Face tracking mapping
-- `create_body_animation_link()`: Body tracking mapping
+### Medium Priority
+- [ ] **Hand Pose Presets**: Add common hand poses for XR applications
+- [ ] **Compression Options**: Add Draco geometry compression support
+- [ ] **Batch Export**: Support exporting multiple avatars at once
+- [ ] **Export Presets**: Save and load export configurations
+- [ ] **ARF Viewer**: Basic preview of exported ARF files
 
-## Limitations
+### Low Priority
+- [ ] **Animation Retargeting**: Map animations between different skeleton types
+- [ ] **Procedural LODs**: Smarter LOD generation with feature preservation
+- [ ] **Texture Atlas**: Combine multiple textures into atlases
+- [ ] **Morph Target Compression**: Optimize blendshape storage
+- [ ] **Documentation**: Add video tutorials and example files
 
-- Animation export is currently in development
-- Texture cropping for optimized UV bounds is not yet implemented
-- Some advanced ARF features may require manual editing of the output
+### Future Enhancements
+- [ ] **MPEG-I Scene Description**: Support for scene composition
+- [ ] **Streaming Format**: Progressive loading support
+- [ ] **WebAssembly Version**: Browser-based export without Blender
+- [ ] **Unity/Unreal Import**: Companion plugins for game engines
+- [ ] **AI-Assisted Mapping**: Automatic detection of face/body landmarks
 
-## License
+## Known Issues
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+1. **Animation Export**: Currently not implemented - animations are detected but not exported
+2. **Large Blendshape Count**: Export may be slow with 100+ blendshapes
+3. **Memory Usage**: Very high-poly meshes may require significant RAM
+4. **Material Limitations**: Complex node-based materials may not export correctly
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## License
+
+This project is licensed under the MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Credits
 
-Developed by Imed Bouazizi as part of the ARF (Avatar Representation Format) implementation.
+Developed by Imed Bouazizi
+
+Based on the ARF specification (ISO/IEC 23090-39:2025) developed by MPEG.
+
+## Support
+
+For issues and feature requests, please use the GitHub issue tracker.
