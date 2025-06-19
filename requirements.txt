@@ -1,0 +1,4 @@
+# Requirements for Blender2ARF Exporter
+# Note: These are Python packages required beyond what Blender provides
+
+numpy>=1.19.0  # For tensor weight export
