@@ -11,6 +11,55 @@ import numpy as np
 from io import BytesIO
 from typing import Dict, List, Any, Optional
 
+def convert_blender_to_gltf_coords(pos):
+    """Convert from Blender's Z-up to glTF's Y-up coordinate system.
+    Blender: X-right, Y-forward, Z-up
+    glTF: X-right, Y-up, Z-forward
+    """
+    if len(pos) == 3:
+        # Swap Y and Z coordinates
+        return [pos[0], pos[2], -pos[1]]
+    return pos
+
+def convert_blender_to_gltf_normal(normal):
+    """Convert normal vectors from Blender to glTF coordinate system."""
+    if len(normal) == 3:
+        # Swap Y and Z components  
+        return [normal[0], normal[2], -normal[1]]
+    return normal
+
+def convert_blender_to_gltf_quaternion(quat):
+    """Convert quaternion from Blender to glTF coordinate system.
+    Blender uses WXYZ, glTF uses XYZW order."""
+    if len(quat) == 4:
+        # First reorder from WXYZ to XYZW if needed
+        # Then apply axis swap for coordinate system
+        # The quaternion needs to be adjusted for the axis swap
+        x, y, z, w = quat[1], quat[2], quat[3], quat[0]
+        # Swap Y and Z, negate the appropriate component
+        return [x, z, -y, w]
+    return quat
+
+def convert_blender_to_gltf_matrix(matrix):
+    """Convert a 4x4 matrix from Blender to glTF coordinate system."""
+    # Create conversion matrix (swap Y and Z axes)
+    conversion = np.array([
+        [1, 0, 0, 0],
+        [0, 0, 1, 0],
+        [0, -1, 0, 0],
+        [0, 0, 0, 1]
+    ])
+    
+    # Convert matrix to numpy array if needed
+    if hasattr(matrix, 'to_4x4'):
+        mat = np.array(matrix.to_4x4())
+    else:
+        mat = np.array(matrix).reshape(4, 4)
+    
+    # Apply conversion: glTF_matrix = conversion @ blender_matrix @ conversion.T
+    result = conversion @ mat @ conversion.T
+    return result.flatten().tolist()
+
 
 class SimpleGLBGenerator:
     """Simplified GLB generator using only built-in modules."""
@@ -284,7 +333,8 @@ class SimpleGLBGenerator:
 
 def export_mesh_to_glb_simple(mesh_obj: bpy.types.Object, output_path: str, 
                               include_skin: bool = False, 
-                              armature_obj: Optional[bpy.types.Object] = None) -> bool:
+                              armature_obj: Optional[bpy.types.Object] = None,
+                              scale: float = 1.0) -> bool:
     """Export a single mesh object to GLB file using simple GLB generator."""
     try:
         mesh = mesh_obj.data
@@ -304,10 +354,16 @@ def export_mesh_to_glb_simple(mesh_obj: bpy.types.Object, output_path: str,
         normals = []
         uvs = []
         
-        # Get vertices
+        # Get vertices with scale applied and coordinate conversion
         for vert in eval_mesh.vertices:
-            vertices.append(list(vert.co))
-            normals.append(list(vert.normal))
+            # Apply scale to vertex positions
+            scaled_pos = [coord * scale for coord in vert.co]
+            # Convert from Blender Z-up to glTF Y-up
+            converted_pos = convert_blender_to_gltf_coords(scaled_pos)
+            vertices.append(converted_pos)
+            # Convert normal vector
+            converted_normal = convert_blender_to_gltf_normal(list(vert.normal))
+            normals.append(converted_normal)
         
         # Get UVs if available
         if eval_mesh.uv_layers.active:
@@ -348,17 +404,64 @@ def export_mesh_to_glb_simple(mesh_obj: bpy.types.Object, output_path: str,
             }]
         }
         
-        # Extract simple material data
-        materials_data = [{
-            'name': 'default',
-            'pbrMetallicRoughness': {
-                'baseColorFactor': [0.8, 0.8, 0.8, 1.0],
-                'metallicFactor': 0.0,
-                'roughnessFactor': 1.0
-            },
-            'alphaMode': 'OPAQUE',
-            'doubleSided': True
-        }]
+        # Extract material data from mesh
+        materials_data = []
+        material_indices = {}
+        
+        # Collect materials from mesh
+        for idx, mat_slot in enumerate(mesh_obj.material_slots):
+            if mat_slot.material:
+                mat = mat_slot.material
+                material_indices[mat.name] = idx
+                
+                # Extract PBR material properties
+                mat_data = {
+                    'name': mat.name,
+                    'pbrMetallicRoughness': {},
+                    'alphaMode': 'OPAQUE',
+                    'doubleSided': True
+                }
+                
+                # Get base color
+                if mat.use_nodes:
+                    # Try to find Principled BSDF node
+                    for node in mat.node_tree.nodes:
+                        if node.type == 'BSDF_PRINCIPLED':
+                            # Base color
+                            base_color = node.inputs['Base Color'].default_value
+                            mat_data['pbrMetallicRoughness']['baseColorFactor'] = [
+                                base_color[0], base_color[1], base_color[2], base_color[3]
+                            ]
+                            # Metallic and roughness
+                            mat_data['pbrMetallicRoughness']['metallicFactor'] = node.inputs['Metallic'].default_value
+                            mat_data['pbrMetallicRoughness']['roughnessFactor'] = node.inputs['Roughness'].default_value
+                            # Alpha
+                            if node.inputs['Alpha'].default_value < 1.0:
+                                mat_data['alphaMode'] = 'BLEND'
+                            break
+                else:
+                    # Fallback to viewport display color
+                    mat_data['pbrMetallicRoughness']['baseColorFactor'] = [
+                        mat.diffuse_color[0], mat.diffuse_color[1], 
+                        mat.diffuse_color[2], mat.diffuse_color[3]
+                    ]
+                    mat_data['pbrMetallicRoughness']['metallicFactor'] = mat.metallic
+                    mat_data['pbrMetallicRoughness']['roughnessFactor'] = mat.roughness
+                
+                materials_data.append(mat_data)
+        
+        # If no materials, add default
+        if not materials_data:
+            materials_data = [{
+                'name': 'default',
+                'pbrMetallicRoughness': {
+                    'baseColorFactor': [0.8, 0.8, 0.8, 1.0],
+                    'metallicFactor': 0.0,
+                    'roughnessFactor': 1.0
+                },
+                'alphaMode': 'OPAQUE',
+                'doubleSided': True
+            }]
         
         # Create GLB
         generator = SimpleGLBGenerator()
@@ -378,13 +481,16 @@ def export_mesh_to_glb_simple(mesh_obj: bpy.types.Object, output_path: str,
 
 
 # Also create simplified versions for skeleton and blendshape export
-def export_skeleton_to_glb_simple(armature_obj: bpy.types.Object, output_path: str) -> bool:
+def export_skeleton_to_glb_simple(armature_obj: bpy.types.Object, output_path: str, scale: float = 1.0) -> bool:
     """Export skeleton as a simple point cloud GLB."""
     try:
-        # Get bone positions
+        # Get bone positions with scale applied and coordinate conversion
         positions = []
         for bone in armature_obj.data.bones:
-            positions.append(list(bone.head_local))
+            scaled_pos = [coord * scale for coord in bone.head_local]
+            # Convert from Blender Z-up to glTF Y-up
+            converted_pos = convert_blender_to_gltf_coords(scaled_pos)
+            positions.append(converted_pos)
         
         # Create mesh data
         mesh_data = {
@@ -423,11 +529,13 @@ def export_blendshape_to_glb_simple(mesh_obj: bpy.types.Object, shape_key_name: 
         basis = mesh.shape_keys.key_blocks[0]
         target = mesh.shape_keys.key_blocks[shape_key_name]
         
-        # Calculate deltas
+        # Calculate deltas with coordinate conversion
         positions = []
         for i, (basis_vert, target_vert) in enumerate(zip(basis.data, target.data)):
             delta = target_vert.co - basis_vert.co
-            positions.append(list(delta))
+            # Convert delta from Blender to glTF coordinates
+            converted_delta = convert_blender_to_gltf_coords(list(delta))
+            positions.append(converted_delta)
         
         # Create mesh data
         mesh_data = {
@@ -455,7 +563,7 @@ def export_blendshape_to_glb_simple(mesh_obj: bpy.types.Object, shape_key_name: 
         return False
 
 
-def export_mesh_with_shape_key_applied(mesh_obj: bpy.types.Object, shape_key_values: dict, output_path: str) -> bool:
+def export_mesh_with_shape_key_applied(mesh_obj: bpy.types.Object, shape_key_values: dict, output_path: str, scale: float = 1.0) -> bool:
     """Export mesh with specific shape key values applied."""
     try:
         # Store original shape key values
@@ -470,7 +578,7 @@ def export_mesh_with_shape_key_applied(mesh_obj: bpy.types.Object, shape_key_val
                     key_block.value = 0.0
         
         # Export the mesh with shape keys applied
-        success = export_mesh_to_glb_simple(mesh_obj, output_path, include_skin=False, armature_obj=None)
+        success = export_mesh_to_glb_simple(mesh_obj, output_path, include_skin=False, armature_obj=None, scale=scale)
         
         # Restore original values
         if mesh_obj.data.shape_keys:

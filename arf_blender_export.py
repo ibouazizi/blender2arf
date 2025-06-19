@@ -36,9 +36,7 @@ from bpy.props import (
 try:
     from addons.arf_exporter.core.arf_compliance import (
         has_vertex_weights, 
-        validate_metadata_compliance,
-        fix_arf_compliance,
-        remove_non_compliant_fields
+        validate_metadata_compliance
     )
 except ImportError:
     # Define fallback functions
@@ -59,12 +57,6 @@ except ImportError:
         
     def validate_metadata_compliance(metadata):
         return metadata
-        
-    def fix_arf_compliance(arf_data):
-        return arf_data
-        
-    def remove_non_compliant_fields(arf_data):
-        return arf_data
 
 # Add script directory to path for imports
 import sys
@@ -77,7 +69,10 @@ from blender_to_glb_simple import (
     export_mesh_to_glb_simple, 
     export_skeleton_to_glb_simple,
     export_blendshape_to_glb_simple,
-    export_mesh_with_shape_key_applied
+    export_mesh_with_shape_key_applied,
+    convert_blender_to_gltf_matrix,
+    convert_blender_to_gltf_coords,
+    convert_blender_to_gltf_quaternion
 )
 # Debug point can be uncommented when needed
 # import pdb; pdb.set_trace()
@@ -370,7 +365,8 @@ def export_mesh_to_glb(obj, temp_dir, settings, armature=None, subfolder="meshes
     
     # Get object name and transform before any operations
     obj_name = obj.name
-    obj_transform = matrix_to_list(obj.matrix_world)
+    # Convert transform from Blender to glTF coordinate system
+    obj_transform = convert_blender_to_gltf_matrix(obj.matrix_world)
     
     # Create subfolder if it doesn't exist
     subfolder_path = os.path.join(temp_dir, subfolder)
@@ -384,9 +380,9 @@ def export_mesh_to_glb(obj, temp_dir, settings, armature=None, subfolder="meshes
         # Determine export type
         if obj.type == 'MESH':
             include_skin = armature is not None
-            success = export_mesh_to_glb_simple(obj, glb_path, include_skin=include_skin, armature_obj=armature)
+            success = export_mesh_to_glb_simple(obj, glb_path, include_skin=include_skin, armature_obj=armature, scale=settings.scale)
         elif obj.type == 'ARMATURE':
-            success = export_skeleton_to_glb_simple(obj, glb_path)
+            success = export_skeleton_to_glb_simple(obj, glb_path, scale=settings.scale)
         else:
             print(f"ERROR: Unknown object type: {obj.type}")
             return None
@@ -433,7 +429,7 @@ def get_skeleton_data(obj):
         "id": skeleton_id,
         "root": None,  # Will set this to the root joint ID
         "joints": [],  # Will contain joint IDs
-        "transform": matrix_to_list(obj.matrix_world)
+        "transform": convert_blender_to_gltf_matrix(obj.matrix_world)
     }
     
     # First pass: collect all bones and create nodes
@@ -464,10 +460,10 @@ def get_skeleton_data(obj):
             "name": bone.name,
             "id": node_id,
             "mapping": f"avatar/skeleton/{bone.name}",
-            "transform": matrix_to_list(bone.matrix_local),
-            "translation": [loc.x, loc.y, loc.z],
-            "rotation": [rot.x, rot.y, rot.z, rot.w],
-            "scale": [scale.x, scale.y, scale.z]
+            "transform": convert_blender_to_gltf_matrix(bone.matrix_local),
+            "translation": convert_blender_to_gltf_coords([loc.x, loc.y, loc.z]),
+            "rotation": convert_blender_to_gltf_quaternion([rot.x, rot.y, rot.z, rot.w]),
+            "scale": [scale.x, scale.y, scale.z]  # Scale doesn't need conversion
         }
         
         if bone.parent:
@@ -511,15 +507,13 @@ def extract_skin_data(mesh_obj, armature_obj, mesh_id, skeleton_id=None):
     # Create the skin component according to ARF spec
     # Schema requires: name, mapping, skeleton, mesh, weights
     skin_data = {
+        "id": skin_id,            # Add the ID field
         "name": f"{mesh_obj.name}_skin",
         "mapping": [],  # Empty mapping array as required
         "skeleton": skeleton_id,  # Reference to the skeleton
         "mesh": mesh_id,          # Reference to the mesh being skinned
         "weights": []  # Will be filled with tensor data references
     }
-    
-    # Store ID separately for internal use
-    skin_data["_internal_id"] = skin_id
     
     return skin_data
 
@@ -938,7 +932,7 @@ def export_blendshapes(mesh_obj, temp_dir, settings):
         
         # Export with all shape keys at 0
         shape_values = {key_block.name: 0.0 for key_block in mesh_obj.data.shape_keys.key_blocks}
-        if export_mesh_with_shape_key_applied(mesh_obj, shape_values, basis_glb_path):
+        if export_mesh_with_shape_key_applied(mesh_obj, shape_values, basis_glb_path, settings.scale):
             exported_blendshapes.append({
                 "id": hash(f"{mesh_obj.name}_Basis") % 10000,
                 "name": "Basis",
@@ -962,7 +956,7 @@ def export_blendshapes(mesh_obj, temp_dir, settings):
             shape_values = {kb.name: 0.0 for kb in mesh_obj.data.shape_keys.key_blocks}
             shape_values[key_block.name] = 1.0
             
-            if export_mesh_with_shape_key_applied(mesh_obj, shape_values, shape_glb_path):
+            if export_mesh_with_shape_key_applied(mesh_obj, shape_values, shape_glb_path, settings.scale):
                 exported_blendshapes.append({
                     "id": hash(f"{mesh_obj.name}_{key_block.name}") % 10000,
                     "name": key_block.name,
@@ -1147,7 +1141,7 @@ def create_lod(mesh_obj, lod_level, temp_dir, settings):
         print("Using custom GLB exporter for LOD")
         try:
             # Export the decimated mesh
-            export_success = export_mesh_to_glb_simple(lod_obj, lod_path, include_skin=False, armature_obj=None)
+            export_success = export_mesh_to_glb_simple(lod_obj, lod_path, include_skin=False, armature_obj=None, scale=settings.scale)
             if export_success:
                 size_kb = os.path.getsize(lod_path) / 1024
                 print(f"LOD export successful (custom exporter): {size_kb:.1f} KB")
@@ -1493,10 +1487,11 @@ def organize_by_asset_type(context, temp_dir, settings):
                                     
                                     # Add skin component
                                     arf_data["components"]["skins"].append(skin_data)
-                                    skin_index = len(arf_data["components"]["skins"]) - 1
-                                    base_lod["skins"].append(skin_index)
-                                    medium_lod["skins"].append(skin_index)
-                                    low_lod["skins"].append(skin_index)
+                                    # Reference skin by its ID, not index
+                                    skin_id = skin_data["id"]
+                                    base_lod["skins"].append(skin_id)
+                                    medium_lod["skins"].append(skin_id)
+                                    low_lod["skins"].append(skin_id)
                                     
                                     print(f"Added skin component for {mesh.name}")
                         else:
@@ -1631,9 +1626,9 @@ def organize_by_asset_type(context, temp_dir, settings):
                                         # Add skin component to ARF document
                                         arf_data["components"]["skins"].append(skin_data)
                                         
-                                        # Reference skin in LOD entry using array index
-                                        skin_index = len(arf_data["components"]["skins"]) - 1
-                                        standalone_asset["lods"][0]["skins"].append(skin_index)
+                                        # Reference skin in LOD entry using element ID
+                                        skin_id = skin_data["id"]
+                                        standalone_asset["lods"][0]["skins"].append(skin_id)
                                         
                                         print(f"Added skin component for standalone mesh {mesh.name}")
                         else:
@@ -1733,6 +1728,53 @@ def find_armature_for_mesh(obj):
             return modifier.object
     return None
 
+def estimate_avatar_height(context):
+    """Estimate the height of the avatar to determine if scaling is needed."""
+    # Find all armatures in the selection
+    armatures = [obj for obj in context.selected_objects if obj.type == 'ARMATURE']
+    
+    if not armatures:
+        # No armature, try to estimate from meshes
+        meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if meshes:
+            # Get bounding box of all meshes
+            min_z = float('inf')
+            max_z = float('-inf')
+            for mesh in meshes:
+                bbox = [mesh.matrix_world @ Vector(corner) for corner in mesh.bound_box]
+                min_z = min(min_z, min(v.z for v in bbox))
+                max_z = max(max_z, max(v.z for v in bbox))
+            return max_z - min_z
+        return 0
+    
+    # Use the first armature to estimate height
+    armature = armatures[0]
+    
+    # Try to find head and foot bones
+    head_z = 0
+    foot_z = 0
+    
+    for bone in armature.data.bones:
+        bone_name_lower = bone.name.lower()
+        # Head bone patterns
+        if any(pattern in bone_name_lower for pattern in ['head', 'neck', 'skull']):
+            head_pos = armature.matrix_world @ bone.head_local
+            if head_pos.z > head_z:
+                head_z = head_pos.z
+        # Foot bone patterns  
+        elif any(pattern in bone_name_lower for pattern in ['foot', 'ankle', 'toe']):
+            foot_pos = armature.matrix_world @ bone.head_local
+            if foot_z == 0 or foot_pos.z < foot_z:
+                foot_z = foot_pos.z
+    
+    # If we found head and foot, use that
+    if head_z > 0 and foot_z >= 0:
+        return head_z - foot_z
+    
+    # Otherwise, use armature bounding box
+    bbox = [armature.matrix_world @ Vector(corner) for corner in armature.bound_box]
+    return max(v.z for v in bbox) - min(v.z for v in bbox)
+
 def export_arf_zip(context, filepath, settings):
     """Export the ARF container as a zip file."""
 
@@ -1752,12 +1794,28 @@ def export_arf_zip(context, filepath, settings):
     os.makedirs(temp_dir, exist_ok=True)
     
     try:
+        # Check if we should auto-scale for human avatars
+        if settings.scale == 1.0:  # Only auto-scale if user hasn't set a custom scale
+            estimated_height = estimate_avatar_height(context)
+            if estimated_height > 0:
+                print(f"\nEstimated avatar height: {estimated_height:.2f} Blender units")
+                # Typical human height is 1.7-1.8 meters
+                # If the avatar is significantly different, suggest scaling
+                if estimated_height > 2.5:  # Likely in centimeters
+                    suggested_scale = 0.01
+                    print(f"Avatar appears to be in centimeters. Applying scale: {suggested_scale}")
+                    settings.scale = suggested_scale
+                elif estimated_height < 1.0:  # Too small
+                    suggested_scale = 1.7 / estimated_height
+                    print(f"Avatar appears too small. Applying scale: {suggested_scale:.2f}")
+                    settings.scale = suggested_scale
+                elif estimated_height > 3.0:  # Too large
+                    suggested_scale = 1.7 / estimated_height
+                    print(f"Avatar appears too large. Applying scale: {suggested_scale:.2f}")
+                    settings.scale = suggested_scale
+        
         # Generate the ARF data structure by organizing assets
         arf_data, files_exported = organize_by_asset_type(context, temp_dir, settings)
-        
-        # Apply ARF compliance fixes
-        arf_data = fix_arf_compliance(arf_data)
-        arf_data = remove_non_compliant_fields(arf_data)
         
         # Write ARF JSON
         arf_json_path = os.path.join(temp_dir, "arf.json")
