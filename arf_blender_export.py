@@ -65,25 +65,28 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
-# Import custom GLB exporter
+# Import custom GLB exporter and utilities
 from glb_exporter import (
-    export_mesh_to_glb_simple, 
-    export_skeleton_to_glb_simple,
-    export_blendshape_to_glb_simple,
+    export_mesh_to_glb,
     export_mesh_with_shape_key_applied,
+    export_blendshape_to_glb_simple,
     convert_blender_to_gltf_matrix,
     convert_blender_to_gltf_coords,
     convert_blender_to_gltf_quaternion
 )
 
-# Import the version with texture cropping
-try:
-    # Use the updated version with power-of-2 support
-    from glb_exporter_cropped import export_mesh_to_glb_with_texture_cropping
-    TEXTURE_CROPPING_AVAILABLE = True
-except ImportError as e:
-    TEXTURE_CROPPING_AVAILABLE = False
-    print(f"Warning: Texture cropping module not available: {e}")
+# Import external texture manager
+from external_texture_manager import ExternalTextureManager
+
+class MinimalTensorConverter:
+    """Stub class - tensor weights not supported in simplified exporter."""
+    def __init__(self, precision='float32', max_influences=4):
+        self.precision = precision
+        self.max_influences = max_influences
+    
+    def extract_and_export_weights(self, mesh_obj, armature_obj, temp_dir, skin_name):
+        print(f"WARNING: Tensor weight export not supported in simplified exporter for {mesh_obj.name}")
+        return None
 # Debug point can be uncommented when needed
 # import pdb; pdb.set_trace()
 
@@ -310,10 +313,7 @@ class MinimalTensorConverter:
             # Write tensor data
             f.write(data.tobytes())
         
-        print(f"Exported ARF tensor: {file_path}")
-        print(f"  Shape: {shape}")
-        print(f"  Dtype: {dtype_name} (glTF: {dtype_enum})")
-        print(f"  Size: {os.path.getsize(file_path)} bytes")
+        # Tensor export logging removed for less verbosity
 
 class ARFExportSettings:
     def __init__(self):
@@ -323,14 +323,14 @@ class ARFExportSettings:
         self.export_skeletons = True
         self.organize_by_collections = True
         self.export_textures = True
-        self.export_lods = True
+        self.export_lods = False  # Disabled by default due to shape key conflicts
         self.optimize_mesh = False
         self.compress_textures = False
-        self.crop_textures = False  # Disable texture cropping by default (requires PIL)
+        # Removed crop_textures - always use external textures without cropping
         self.include_preview = True
         self.apply_modifiers = True
         self.folder_structure = "organized"  # "organized" or "flat"
-        self.debug_mode = True  # Added debug mode
+        self.debug_mode = False  # Debug mode off by default
         # Add tensor weight settings
         self.use_tensor_weights = True  # Default to tensor weights for better performance
         self.tensor_precision = 'float32'  # Options: float32, float16, uint16, uint8
@@ -340,6 +340,10 @@ class ARFExportSettings:
         self.create_body_mapping = True  # Create XR_FB_body_tracking mapping by default
         self.blendshape_standard = 'OPENXR_FACE'  # Default to OpenXR Face standard
         self.skeleton_standard = 'OPENXR_BODY'  # Default to OpenXR Body standard
+        
+        # External texture settings
+        self.use_external_textures = True  # Export textures as separate files for reuse
+        self.texture_reuse = True  # Enable texture deduplication and sharing
 
 
 # Global counters for sequential component IDs
@@ -367,17 +371,57 @@ def matrix_to_list(matrix):
     return [value for row in matrix for value in row]
 
 
+def debug_print(settings, message):
+    """Print message only if debug mode is enabled."""
+    if settings.debug_mode:
+        print(message)
 
-def export_mesh_to_glb(obj, temp_dir, settings, armature=None, subfolder="meshes"):
-    """Export a single mesh to GLB format using custom exporter."""
+
+class ProgressBar:
+    """Simple progress bar for command line output."""
+    def __init__(self, total, settings, width=50):
+        self.total = total
+        self.current = 0
+        self.width = width
+        self.settings = settings
+        self.last_percent = -1
+        
+    def update(self, increment=1, status=""):
+        """Update progress bar."""
+        if self.settings.debug_mode:
+            return  # Don't show progress bar in debug mode
+            
+        self.current += increment
+        if self.total == 0:
+            return
+            
+        percent = int(100 * self.current / self.total)
+        
+        # Only update if percentage changed
+        if percent == self.last_percent:
+            return
+            
+        self.last_percent = percent
+        filled = int(self.width * self.current / self.total)
+        bar = '█' * filled + '░' * (self.width - filled)
+        
+        # Clear line and print progress
+        print(f'\r[{bar}] {percent}% {status:<30}', end='', flush=True)
+        
+        if self.current >= self.total:
+            print()  # New line when complete
+
+
+def export_mesh_to_glb_wrapper(obj, temp_dir, settings, armature=None, subfolder="meshes", texture_manager=None, asset_name=None):
+    """Export a single mesh to GLB format using the consolidated exporter."""
     global _data_counter
     
-    print(f"\nExporting mesh: {obj.name}")
+    debug_print(settings, f"\nExporting mesh: {obj.name}")
     
     # Get object name and transform before any operations
     obj_name = obj.name
     # Convert transform from Blender to glTF coordinate system
-    obj_transform = convert_blender_to_gltf_matrix(obj.matrix_world)
+    obj_transform = matrix_to_list(convert_blender_to_gltf_matrix(obj.matrix_world))
     
     # Create subfolder if it doesn't exist
     subfolder_path = os.path.join(temp_dir, subfolder)
@@ -385,34 +429,28 @@ def export_mesh_to_glb(obj, temp_dir, settings, armature=None, subfolder="meshes
     
     # Export path
     glb_path = os.path.join(subfolder_path, f"{obj_name}.glb")
-    print(f"Exporting to: {glb_path}")
+    debug_print(settings, f"Exporting to: {glb_path}")
     
     try:
-        # Determine export type
+        # Only support mesh export with the new consolidated exporter
         if obj.type == 'MESH':
-            include_skin = armature is not None
-            # Use texture cropping version if available and enabled
-            if TEXTURE_CROPPING_AVAILABLE and settings.crop_textures:
-                try:
-                    success = export_mesh_to_glb_with_texture_cropping(
-                        obj, glb_path, scale=settings.scale, crop_textures=True,
-                        include_skin=include_skin, armature_obj=armature
-                    )
-                except Exception as e:
-                    print(f"Texture cropping failed: {e}, falling back to simple export")
-                    success = export_mesh_to_glb_simple(obj, glb_path, include_skin=include_skin, armature_obj=armature, scale=settings.scale)
-            else:
-                success = export_mesh_to_glb_simple(obj, glb_path, include_skin=include_skin, armature_obj=armature, scale=settings.scale)
-        elif obj.type == 'ARMATURE':
-            success = export_skeleton_to_glb_simple(obj, glb_path, scale=settings.scale)
+            # Always use external textures
+            if not texture_manager:
+                print(f"ERROR: No texture manager provided for {obj.name}")
+                return None
+                
+            success = export_mesh_to_glb(
+                obj, glb_path, texture_manager, 
+                scale=settings.scale, asset_name=asset_name
+            )
         else:
-            print(f"ERROR: Unknown object type: {obj.type}")
+            print(f"ERROR: Unsupported object type: {obj.type}")
             return None
             
         if success and os.path.exists(glb_path):
             size = os.path.getsize(glb_path)
-            print(f"GLB export successful")
-            print(f"GLB file size: {size/1024:.1f} KB")
+            debug_print(settings, f"GLB export successful")
+            debug_print(settings, f"GLB file size: {size/1024:.1f} KB")
             
             # Only return data if file was created successfully
             data_id = _data_counter
@@ -451,7 +489,7 @@ def get_skeleton_data(obj):
         "id": skeleton_id,
         "root": None,  # Will set this to the root joint ID
         "joints": [],  # Will contain joint IDs
-        "transform": convert_blender_to_gltf_matrix(obj.matrix_world)
+        "transform": matrix_to_list(convert_blender_to_gltf_matrix(obj.matrix_world))
     }
     
     # First pass: collect all bones and create nodes
@@ -482,7 +520,7 @@ def get_skeleton_data(obj):
             "name": bone.name,
             "id": node_id,
             "mapping": f"avatar/skeleton/{bone.name}",
-            "transform": convert_blender_to_gltf_matrix(bone.matrix_local),
+            "transform": matrix_to_list(convert_blender_to_gltf_matrix(bone.matrix_local)),
             "translation": convert_blender_to_gltf_coords([loc.x, loc.y, loc.z]),
             "rotation": convert_blender_to_gltf_quaternion([rot.x, rot.y, rot.z, rot.w]),
             "scale": [scale.x, scale.y, scale.z]  # Scale doesn't need conversion
@@ -544,11 +582,11 @@ def export_skin_weights(mesh_obj, armature_obj, temp_dir, settings):
     if not mesh_obj or not armature_obj:
         return None
     
-    print(f"\nExporting skin weights for: {mesh_obj.name}")
+    debug_print(settings, f"\nExporting skin weights for: {mesh_obj.name}")
     
     if settings.use_tensor_weights:
         # Use tensor format
-        print(f"  Using tensor format (precision: {settings.tensor_precision})")
+        debug_print(settings, f"  Using tensor format (precision: {settings.tensor_precision})")
         
         converter = MinimalTensorConverter(
             precision=settings.tensor_precision,
@@ -561,20 +599,20 @@ def export_skin_weights(mesh_obj, armature_obj, temp_dir, settings):
         )
         
         if tensor_entries:
-            print(f"  Exported tensor weights: {len(tensor_entries)} files")
+            debug_print(settings, f"  Exported tensor weights: {len(tensor_entries)} files")
             for entry in tensor_entries:
                 # Get file size for logging
                 tensor_path = os.path.join(temp_dir, entry['uri'])
                 if os.path.exists(tensor_path):
                     size_kb = os.path.getsize(tensor_path) / 1024
-                    print(f"    {entry['name']}: {size_kb:.1f} KB")
+                    debug_print(settings, f"    {entry['name']}: {size_kb:.1f} KB")
             return tensor_entries
         else:
             print(f"  ERROR: Failed to export tensor weights")
             return None
     else:
         # Original GLB format
-        print(f"  Using GLB format")
+        debug_print(settings, f"  Using GLB format")
     
     # Create subfolder for skins if it doesn't exist
     skins_folder = os.path.join(temp_dir, "skins")
@@ -588,22 +626,15 @@ def export_skin_weights(mesh_obj, armature_obj, temp_dir, settings):
     skin_path = os.path.join(skins_folder, f"{skin_name}.glb")
     
     try:
-        # Export mesh with skinning data
-        if TEXTURE_CROPPING_AVAILABLE and settings.crop_textures:
-            try:
-                success = export_mesh_to_glb_with_texture_cropping(
-                    mesh_obj, skin_path, scale=settings.scale, crop_textures=True,
-                    include_skin=True, armature_obj=armature_obj
-                )
-            except Exception as e:
-                print(f"Texture cropping failed for skin: {e}, falling back to simple export")
-                success = export_mesh_to_glb_simple(mesh_obj, skin_path, include_skin=True, armature_obj=armature_obj, scale=settings.scale)
-        else:
-            success = export_mesh_to_glb_simple(mesh_obj, skin_path, include_skin=True, armature_obj=armature_obj, scale=settings.scale)
+        # Export mesh with skinning data - simplified version doesn't support skinning
+        # This function is kept for compatibility but will need to be updated
+        # if skinning support is required
+        print("WARNING: Skinning export not supported in simplified exporter")
+        success = False
         
         if success and os.path.exists(skin_path):
             size_kb = os.path.getsize(skin_path) / 1024
-            print(f"Exported skin weights: {skin_name} ({size_kb:.1f} KB)")
+            debug_print(settings, f"Exported skin weights: {skin_name} ({size_kb:.1f} KB)")
             
             # Create the data entry for the skin weights file
             skin_data_entry = {
@@ -938,7 +969,7 @@ def export_blendshapes(mesh_obj, temp_dir, settings):
     if not mesh_obj.data.shape_keys:
         return []
         
-    print(f"\nExporting blendshapes for {mesh_obj.name}")
+    debug_print(settings, f"\nExporting blendshapes for {mesh_obj.name}")
     
     # Create the blendshapes directory
     blendshapes_dir = os.path.join(temp_dir, "blendshapes")
@@ -958,25 +989,7 @@ def export_blendshapes(mesh_obj, temp_dir, settings):
     exported_blendshapes = []
     
     try:
-        # First export the basis shape (mesh with no shape keys applied)
-        basis_name = f"{mesh_obj.name}_Basis"
-        basis_glb_path = os.path.join(blendshapes_dir, f"{basis_name}.glb")
-        
-        # Export with all shape keys at 0
-        shape_values = {key_block.name: 0.0 for key_block in mesh_obj.data.shape_keys.key_blocks}
-        # Basis mesh should include materials and textures
-        if export_mesh_with_shape_key_applied(mesh_obj, shape_values, basis_glb_path, settings.scale, include_materials=True):
-            exported_blendshapes.append({
-                "id": hash(f"{mesh_obj.name}_Basis") % 10000,
-                "name": "Basis",
-                "type": "model/gltf-binary",
-                "uri": f"blendshapes/{basis_name}.glb"
-            })
-            print(f"Exported basis blendshape: {basis_name}")
-            if os.path.exists(basis_glb_path):
-                size_kb = os.path.getsize(basis_glb_path) / 1024
-                print(f"  Size: {size_kb:.1f} KB")
-        
+        # Skip exporting the basis shape as it's redundant - the base mesh is already exported under meshes
         # Now export each blendshape individually
         for key_block in mesh_obj.data.shape_keys.key_blocks:
             if key_block == basis_key:
@@ -997,10 +1010,10 @@ def export_blendshapes(mesh_obj, temp_dir, settings):
                     "type": "model/gltf-binary",
                     "uri": f"blendshapes/{shape_name}.glb"
                 })
-                print(f"Exported blendshape: {shape_name}")
+                debug_print(settings, f"Exported blendshape: {shape_name}")
                 if os.path.exists(shape_glb_path):
                     size_kb = os.path.getsize(shape_glb_path) / 1024
-                    print(f"  Size: {size_kb:.1f} KB")
+                    debug_print(settings, f"  Size: {size_kb:.1f} KB")
             else:
                 print(f"ERROR: Failed to export blendshape: {shape_name}")
                 
@@ -1036,7 +1049,7 @@ def export_animations(armature_obj, temp_dir, settings):
         print(f"No animations found for {armature_obj.name}")
         return animation_data
     
-    print(f"Exporting animations for {armature_obj.name}")
+    debug_print(settings, f"Exporting animations for {armature_obj.name}")
     
     # Create a temporary scene for animation export
     temp_scene = bpy.data.scenes.new("ARFAnimExport")
@@ -1070,8 +1083,8 @@ def export_animations(armature_obj, temp_dir, settings):
         # Export the animation to GLB
         anim_path = os.path.join(animations_dir, f"{anim_name}.glb")
         # TODO: Implement animation export using custom GLB exporter
-        print(f"WARNING: Animation export not yet implemented with custom GLB exporter")
-        print(f"Skipping animation: {anim_name}")
+        debug_print(settings, f"WARNING: Animation export not yet implemented with custom GLB exporter")
+        debug_print(settings, f"Skipping animation: {anim_name}")
         return []
         
         # Placeholder for when animation export is implemented
@@ -1086,7 +1099,7 @@ def export_animations(armature_obj, temp_dir, settings):
                 "uri": f"animations/{anim_name}.glb",
                 "target": armature_obj.name
             })
-            print(f"Exported animation: {anim_name}")
+            debug_print(settings, f"Exported animation: {anim_name}")
         else:
             print(f"Failed to export animation: {anim_name}")
     
@@ -1111,7 +1124,7 @@ def create_lod(mesh_obj, lod_level, temp_dir, settings):
     if not settings.export_lods:
         return None
     
-    print(f"Creating LOD {lod_level} for {mesh_obj.name}")
+    debug_print(settings, f"Creating LOD {lod_level} for {mesh_obj.name}")
     
     # Create a temporary scene
     temp_scene = bpy.data.scenes.new("ARFLodScene")
@@ -1148,12 +1161,12 @@ def create_lod(mesh_obj, lod_level, temp_dir, settings):
             temp_scene.view_layers[0].objects.active = lod_obj
             bpy.ops.object.modifier_apply(modifier=decimate.name)
         except Exception as e:
-            print(f"First attempt to apply modifier failed: {str(e)}, trying alternate method")
+            debug_print(settings, f"First attempt to apply modifier failed: {str(e)}, trying alternate method")
             try:
                 # Try older API variant
                 bpy.ops.object.modifier_apply({"object": lod_obj}, modifier=decimate.name)
             except Exception as e2:
-                print(f"Second attempt to apply modifier failed: {str(e2)}, trying final method")
+                debug_print(settings, f"Second attempt to apply modifier failed: {str(e2)}, trying final method")
                 # Last resort - try the 2.8+ API directly
                 try:
                     depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -1161,7 +1174,7 @@ def create_lod(mesh_obj, lod_level, temp_dir, settings):
                     lod_obj.modifiers.remove(decimate)
                     lod_obj.data = bpy.data.meshes.new_from_object(mesh_eval)
                 except Exception as e3:
-                    print(f"Failed to apply modifier through any method: {str(e3)}")
+                    debug_print(settings, f"Failed to apply modifier through any method: {str(e3)}")
                     # Continue anyway as the glTF export might still work with unapplied modifier
         
         # Export the LOD mesh
@@ -1172,24 +1185,27 @@ def create_lod(mesh_obj, lod_level, temp_dir, settings):
         
         # Use custom GLB exporter
         export_success = False
-        print("Using custom GLB exporter for LOD")
+        debug_print(settings, "Using custom GLB exporter for LOD")
         try:
-            # Export the decimated mesh
-            export_success = export_mesh_to_glb_simple(lod_obj, lod_path, include_skin=False, armature_obj=None, scale=settings.scale)
+            # Export the decimated mesh without materials/textures
+            # Create a temporary texture manager for LOD export (won't be used since include_materials=False)
+            temp_texture_manager = ExternalTextureManager(temp_dir)
+            export_success = export_mesh_to_glb(lod_obj, lod_path, temp_texture_manager, 
+                                              scale=settings.scale, include_materials=False)
             if export_success:
                 size_kb = os.path.getsize(lod_path) / 1024
-                print(f"LOD export successful (custom exporter): {size_kb:.1f} KB")
+                debug_print(settings, f"LOD export successful (custom exporter): {size_kb:.1f} KB")
             else:
-                print("Custom LOD export failed")
+                debug_print(settings, "Custom LOD export failed")
         except Exception as e:
-            print(f"LOD export error with custom exporter: {str(e)}")
+            debug_print(settings, f"LOD export error with custom exporter: {str(e)}")
             if settings.debug_mode:
                 import traceback
                 traceback.print_exc()
         
         # No fallback - custom exporter is required
         if not export_success:
-            print("ERROR: Failed to export LOD with custom exporter")
+            debug_print(settings, "ERROR: Failed to export LOD with custom exporter")
             return None
         
         if export_success and os.path.exists(lod_path):
@@ -1203,11 +1219,11 @@ def create_lod(mesh_obj, lod_level, temp_dir, settings):
                 "level": lod_level
             }
         else:
-            print(f"Failed to export LOD {lod_level} for {mesh_obj.name}")
+            debug_print(settings, f"Failed to export LOD {lod_level} for {mesh_obj.name}")
             return None
             
     except Exception as e:
-        print(f"Error creating LOD: {str(e)}")
+        debug_print(settings, f"Error creating LOD: {str(e)}")
         if settings.debug_mode:
             import traceback
             traceback.print_exc()
@@ -1307,7 +1323,7 @@ def organize_meshes_into_assets(context):
     
     return assets
 
-def organize_by_asset_type(context, temp_dir, settings):
+def organize_by_asset_type(context, temp_dir, settings, user_metadata=None):
     """Organize the export by individual assets with shared skeleton."""
     global _mesh_counter, _data_counter
     
@@ -1316,7 +1332,20 @@ def organize_by_asset_type(context, temp_dir, settings):
     # Reset component counters for clean export
     reset_component_counters()
     
-    print("\nOrganizing assets...")
+    # Count total tasks for progress bar
+    mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+    total_tasks = len(mesh_objects) * 3  # mesh export, blendshapes, skin weights
+    
+    # Create progress bar
+    progress = ProgressBar(total_tasks, settings)
+    
+    if settings.debug_mode:
+        print("\nOrganizing assets...")
+    
+    # Initialize external texture manager (always enabled)
+    texture_manager = ExternalTextureManager(temp_dir)
+    if settings.debug_mode:
+        print("✓ External texture manager initialized")
     
     # Gather data structures for the ARF format
     # Build ARF document with corrected preamble per ISO/IEC 23090-39
@@ -1333,7 +1362,7 @@ def organize_by_asset_type(context, temp_dir, settings):
                 "proprietaryAnimations": []
             }
         },
-        "metadata": generate_metadata(),
+        "metadata": generate_metadata(user_metadata),
         "structure": {
             "assets": []
         },
@@ -1363,9 +1392,10 @@ def organize_by_asset_type(context, temp_dir, settings):
             }
         }
     
-    print(f"Found {len(collection_assets)} assets")
-    for asset_name, asset_data in collection_assets.items():
-        print(f"  {asset_name}: {len(asset_data['meshes'])} meshes, {len(asset_data['armatures'])} armatures")
+    if settings.debug_mode:
+        print(f"Found {len(collection_assets)} assets")
+        for asset_name, asset_data in collection_assets.items():
+            print(f"  {asset_name}: {len(asset_data['meshes'])} meshes, {len(asset_data['armatures'])} armatures")
     
     # Step 1: Process all armatures first (skeleton is shared across all assets)
     all_armatures = []
@@ -1380,7 +1410,7 @@ def organize_by_asset_type(context, temp_dir, settings):
     
     # If no armatures are explicitly assigned, find them from meshes
     if not all_armatures:
-        print("No armatures in assets, searching for armatures used by meshes...")
+        debug_print(settings, "No armatures in assets, searching for armatures used by meshes...")
         armatures_from_meshes = set()
         for asset_data in collection_assets.values():
             for mesh in asset_data['meshes']:
@@ -1388,7 +1418,7 @@ def organize_by_asset_type(context, temp_dir, settings):
                 if armature:
                     armatures_from_meshes.add(armature)
         all_armatures = list(armatures_from_meshes)
-        print(f"Found {len(all_armatures)} armatures from mesh modifiers")
+        debug_print(settings, f"Found {len(all_armatures)} armatures from mesh modifiers")
     
     # Export skeletons
     for armature in all_armatures:
@@ -1398,7 +1428,7 @@ def organize_by_asset_type(context, temp_dir, settings):
                 arf_data["components"]["skeletons"].append(skeleton_data)
                 arf_data["components"]["nodes"].extend(node_data)
                 skeleton_map[armature] = skeleton_data["id"]
-                print(f"Exported shared skeleton: {armature.name} (id: {skeleton_data['id']})")
+                debug_print(settings, f"Exported shared skeleton: {armature.name} (id: {skeleton_data['id']})")
     
     # Get list of all skeleton IDs for sharing
     shared_skeleton_ids = list(skeleton_map.values())
@@ -1408,7 +1438,7 @@ def organize_by_asset_type(context, temp_dir, settings):
     files_exported = []
     
     for asset_name, asset_data in collection_assets.items():
-        print(f"\nProcessing asset: {asset_name}")
+        debug_print(settings, f"\nProcessing asset: {asset_name}")
         
         mesh_objects = asset_data['meshes']
         armature_objects = asset_data['armatures']
@@ -1443,9 +1473,9 @@ def organize_by_asset_type(context, temp_dir, settings):
                 if armature not in armature_mesh_map:
                     armature_mesh_map[armature] = []
                 armature_mesh_map[armature].append(mesh)
-                print(f"Mesh {mesh.name} is linked to armature {armature.name}")
+                debug_print(settings, f"Mesh {mesh.name} is linked to armature {armature.name}")
             else:
-                print(f"Mesh {mesh.name} has no armature")
+                debug_print(settings, f"Mesh {mesh.name} has no armature")
         
         # Initialize LOD structures with shared skeletons
         base_lod = {
@@ -1476,7 +1506,8 @@ def organize_by_asset_type(context, temp_dir, settings):
             armature = find_armature_for_mesh(mesh)
             
             # Export the main mesh
-            mesh_data = export_mesh_to_glb(mesh, temp_dir, settings, armature)
+            progress.update(1, f"Exporting {mesh.name}")
+            mesh_data = export_mesh_to_glb_wrapper(mesh, temp_dir, settings, armature, texture_manager=texture_manager, asset_name=asset_name)
             if mesh_data:
                 files_exported.append(os.path.join(temp_dir, mesh_data["uri"]))
                 # Use the actual mesh data ID for proper referencing
@@ -1502,6 +1533,7 @@ def organize_by_asset_type(context, temp_dir, settings):
                             skin_data = extract_skin_data(mesh, armature, mesh_id, skeleton_id)
                             if skin_data:
                                 # Export weights (tensor or GLB)
+                                progress.update(1, f"Exporting skin weights")
                                 weight_data = export_skin_weights(mesh, armature, temp_dir, settings)
                                 
                                 if weight_data:
@@ -1527,11 +1559,11 @@ def organize_by_asset_type(context, temp_dir, settings):
                                     medium_lod["skins"].append(skin_id)
                                     low_lod["skins"].append(skin_id)
                                     
-                                    print(f"Added skin component for {mesh.name}")
+                                    debug_print(settings, f"Added skin component for {mesh.name}")
                         else:
-                            print(f"Warning: Mesh {mesh.name} has armature {armature.name} but skeleton not found in skeleton_map")
+                            debug_print(settings, f"Warning: Mesh {mesh.name} has armature {armature.name} but skeleton not found in skeleton_map")
                     else:
-                        print(f"Mesh {mesh.name} has no vertex weights")
+                        debug_print(settings, f"Mesh {mesh.name} has no vertex weights")
                 
                 # Export blendshapes if present
                 if settings.export_blendshapes and mesh.data.shape_keys:
@@ -1544,6 +1576,7 @@ def organize_by_asset_type(context, temp_dir, settings):
                             lod["blendshapeSets"].append(blendshape_set["id"])
                         
                         # Export individual blendshapes
+                        progress.update(1, f"Exporting blendshapes")
                         for bs_entry in export_blendshapes(mesh, temp_dir, settings):
                             if bs_entry:
                                 files_exported.append(os.path.join(temp_dir, bs_entry["uri"]))
@@ -1607,7 +1640,7 @@ def organize_by_asset_type(context, temp_dir, settings):
                     print(f"  Found unselected armature: {standalone_armature.name}")
                 
                 # Export standalone mesh
-                mesh_data = export_mesh_to_glb(mesh, temp_dir, settings, standalone_armature)
+                mesh_data = export_mesh_to_glb_wrapper(mesh, temp_dir, settings, standalone_armature, texture_manager=texture_manager, asset_name="standalone_meshes")
                 if mesh_data:
                     files_exported.append(os.path.join(temp_dir, mesh_data["uri"]))
                     # Use the actual mesh data ID for proper referencing
@@ -1687,7 +1720,7 @@ def organize_by_asset_type(context, temp_dir, settings):
     
     # Create ARF-compliant AnimationLinks if enabled
     if settings.create_face_mapping or settings.create_body_mapping:
-        print("\nCreating XR AnimationLinks...")
+        debug_print(settings, "\nCreating XR AnimationLinks...")
         
         # Create face tracking AnimationLink if we have blendshapes
         if settings.create_face_mapping and arf_data["components"]["blendshapeSets"]:
@@ -1705,7 +1738,7 @@ def organize_by_asset_type(context, temp_dir, settings):
                 face_animation_link = create_face_animation_link(blendshape_data_items, settings)
                 if face_animation_link:
                     arf_data["components"]["animationLinks"].append(face_animation_link)
-                    print(f"✅ Created face tracking AnimationLink with {len(face_animation_link['mappings'])} mappings")
+                    debug_print(settings, f"✅ Created face tracking AnimationLink with {len(face_animation_link['mappings'])} mappings")
                 else:
                     print("⚠️  No face tracking mappings found for existing blendshapes")
         
@@ -1717,20 +1750,61 @@ def organize_by_asset_type(context, temp_dir, settings):
                 body_animation_link = create_body_animation_link(skeleton, nodes_data, settings)
                 if body_animation_link:
                     arf_data["components"]["animationLinks"].append(body_animation_link)
-                    print(f"✅ Created body tracking AnimationLink with {len(body_animation_link['mappings'])} mappings")
+                    debug_print(settings, f"✅ Created body tracking AnimationLink with {len(body_animation_link['mappings'])} mappings")
                     break  # Only create one body animation link
     
-    # Print warning if no files were exported
-    if not files_exported:
-        print("WARNING: No asset files were exported. The ZIP will only contain arf.json.")
-    else:
-        print(f"Successfully exported {len(files_exported)} asset files:")
-        for exported_file in files_exported:
-            print(f"  - {os.path.basename(exported_file)}")
+    # Only show export summary in debug mode
+    if settings.debug_mode:
+        if not files_exported:
+            print("WARNING: No asset files were exported. The ZIP will only contain arf.json.")
+        else:
+            print(f"Successfully exported {len(files_exported)} asset files:")
+            for exported_file in files_exported:
+                print(f"  - {os.path.basename(exported_file)}")
     
     return arf_data, files_exported
 
-def generate_metadata():
+def prompt_for_metadata():
+    """Prompt user for metadata in headless mode."""
+    metadata = {}
+    
+    if bpy.app.background:
+        print("\n=== Avatar Metadata ===")
+        
+        # Name
+        name = input("Avatar name (press Enter to skip): ").strip()
+        if name:
+            metadata['name'] = name
+            
+        # Gender
+        print("Gender options: male, female, other, none")
+        gender = input("Gender (press Enter to skip): ").strip().lower()
+        if gender in ['male', 'female', 'other', 'none']:
+            metadata['gender'] = gender
+            
+        # Age
+        age_str = input("Age (press Enter to skip): ").strip()
+        if age_str.isdigit():
+            metadata['age'] = int(age_str)
+            
+        # Height
+        height_str = input("Height in meters (e.g., 1.75, press Enter to skip): ").strip()
+        if height_str:
+            try:
+                height = float(height_str)
+                if 0.5 <= height <= 3.0:  # Reasonable range
+                    metadata['height'] = height
+                else:
+                    print("Height seems unrealistic, will estimate from model")
+            except ValueError:
+                print("Invalid height format, will estimate from model")
+                
+        print("======================\n")
+    
+    return metadata
+
+
+def generate_metadata(user_metadata=None):
     """Generate ARF-compliant metadata."""
     # Check if there's metadata from the GUI
     if hasattr(bpy.context.scene, 'arf_export_settings'):
@@ -1747,13 +1821,27 @@ def generate_metadata():
             except:
                 pass
     
-    # Fallback to basic compliant metadata
-    return {
-        "name": bpy.path.basename(bpy.data.filepath).split('.')[0] or "untitled",
+    # Use user_metadata if provided, otherwise use defaults
+    default_name = bpy.path.basename(bpy.data.filepath).split('.')[0] or "untitled"
+    
+    metadata = {
+        "name": default_name,
         "id": str(uuid.uuid4()),
         "age": 25,  # Integer as required by schema
         "gender": "unspecified"  # String as required by schema
     }
+    
+    # Override with user_metadata if provided
+    if user_metadata:
+        if 'name' in user_metadata:
+            metadata['name'] = user_metadata['name']
+        if 'age' in user_metadata:
+            metadata['age'] = user_metadata['age']
+        if 'gender' in user_metadata:
+            metadata['gender'] = user_metadata['gender']
+        # Height is collected but not saved to metadata - only used for scaling
+    
+    return metadata
 
 def find_armature_for_mesh(obj):
     """Find the armature associated with a mesh through modifiers."""
@@ -1821,62 +1909,88 @@ def export_arf_zip(context, filepath, settings):
     output_dir = os.path.dirname(filepath)
     filepath = os.path.join(output_dir, f"{blend_filename}.zip")
 
-    print(f"Using output file: {filepath}")
+    # Only show essential info in non-debug mode
+    if settings.debug_mode:
+        print(f"Using output file: {filepath}")
+    else:
+        print(f"\nExporting: {os.path.basename(filepath)}")
+    
+    # Prompt for metadata in headless mode
+    user_metadata = prompt_for_metadata() if bpy.app.background else {}
 
     # Create temporary directory
     temp_dir = os.path.join(os.path.dirname(filepath), "arf_temp")
     os.makedirs(temp_dir, exist_ok=True)
     
     try:
-        # Check if we should auto-scale for human avatars
+        # Check if we should auto-scale based on provided height or avatar estimation
         if settings.scale == 1.0:  # Only auto-scale if user hasn't set a custom scale
             estimated_height = estimate_avatar_height(context)
             if estimated_height > 0:
-                print(f"\nEstimated avatar height: {estimated_height:.2f} Blender units")
-                # Typical human height is 1.7-1.8 meters
-                # If the avatar is significantly different, suggest scaling
-                if estimated_height > 2.5:  # Likely in centimeters
-                    suggested_scale = 0.01
-                    print(f"Avatar appears to be in centimeters. Applying scale: {suggested_scale}")
-                    settings.scale = suggested_scale
-                elif estimated_height < 1.0:  # Too small
-                    suggested_scale = 1.7 / estimated_height
-                    print(f"Avatar appears too small. Applying scale: {suggested_scale:.2f}")
-                    settings.scale = suggested_scale
-                elif estimated_height > 3.0:  # Too large
-                    suggested_scale = 1.7 / estimated_height
-                    print(f"Avatar appears too large. Applying scale: {suggested_scale:.2f}")
-                    settings.scale = suggested_scale
+                # Use provided height if available, otherwise use default
+                target_height = user_metadata.get('height', 1.75) if user_metadata else 1.75
+                
+                if settings.debug_mode:
+                    print(f"\nEstimated avatar height: {estimated_height:.2f} Blender units")
+                    if 'height' in user_metadata:
+                        print(f"Target height from user: {target_height:.2f} meters")
+                
+                # Calculate scale to match target height
+                suggested_scale = target_height / estimated_height
+                
+                # Apply different logic based on the scale needed
+                if suggested_scale < 0.1 or suggested_scale > 10.0:
+                    # Extreme scaling suggests unit mismatch
+                    if estimated_height > 100:  # Likely in millimeters
+                        suggested_scale = target_height / (estimated_height / 1000)
+                        if settings.debug_mode:
+                            print(f"Avatar appears to be in millimeters. Applying scale: {suggested_scale:.4f}")
+                    elif estimated_height > 10:  # Likely in centimeters
+                        suggested_scale = target_height / (estimated_height / 100)
+                        if settings.debug_mode:
+                            print(f"Avatar appears to be in centimeters. Applying scale: {suggested_scale:.4f}")
+                    else:
+                        if settings.debug_mode:
+                            print(f"Applying scale to reach {target_height}m height: {suggested_scale:.4f}")
+                else:
+                    if abs(suggested_scale - 1.0) > 0.1:  # Only scale if significantly different
+                        if settings.debug_mode:
+                            print(f"Scaling avatar from {estimated_height:.2f} to {target_height:.2f}m (scale: {suggested_scale:.4f})")
+                    else:
+                        suggested_scale = 1.0  # Close enough, don't scale
+                        
+                settings.scale = suggested_scale
         
         # Generate the ARF data structure by organizing assets
-        arf_data, files_exported = organize_by_asset_type(context, temp_dir, settings)
+        arf_data, files_exported = organize_by_asset_type(context, temp_dir, settings, user_metadata)
         
         # Write ARF JSON
         arf_json_path = os.path.join(temp_dir, "arf.json")
         with open(arf_json_path, "w") as f:
             json.dump(arf_data, f, indent=4)
         
-        # Log export progress
-        print("\n=== ARF Export Progress ===")
-        print(f"Export path: {filepath}")
-        print(f"Scale factor: {settings.scale}")
-        
-        # Count selected objects by type
-        mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
-        armature_objects = [obj for obj in context.selected_objects if obj.type == 'ARMATURE']
-        print(f"\nExporting {len(mesh_objects)} meshes and {len(armature_objects)} armatures")
-        
-        # List all generated files
-        print("\nGenerated files:")
-        total_size = 0
-        for root, dirs, files in os.walk(temp_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, temp_dir)
-                size = os.path.getsize(file_path)
-                total_size += size
-                size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.1f} MB"
-                print(f"- {rel_path:<50} {size_str:>10}")
+        # Only show detailed progress in debug mode
+        if settings.debug_mode:
+            print("\n=== ARF Export Progress ===")
+            print(f"Export path: {filepath}")
+            print(f"Scale factor: {settings.scale}")
+            
+            # Count selected objects by type
+            mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+            armature_objects = [obj for obj in context.selected_objects if obj.type == 'ARMATURE']
+            print(f"\nExporting {len(mesh_objects)} meshes and {len(armature_objects)} armatures")
+            
+            # List all generated files
+            print("\nGenerated files:")
+            total_size = 0
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, temp_dir)
+                    size = os.path.getsize(file_path)
+                    total_size += size
+                    size_str = f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.1f} MB"
+                    print(f"- {rel_path:<50} {size_str:>10}")
         
         # Check if any files were exported
         if len(files_exported) == 0:
@@ -1890,20 +2004,25 @@ def export_arf_zip(context, filepath, settings):
                 for file in files:
                     file_path = os.path.join(root, file)
                     rel_path = os.path.relpath(file_path, temp_dir)
-                    print(f"Adding to ZIP: {rel_path}")
+                    debug_print(settings, f"Adding to ZIP: {rel_path}")
                     zipf.write(file_path, rel_path)
         
-        # Verify and report ZIP contents
-        print("\nVerifying ARF container contents:")
-        with zipfile.ZipFile(filepath, 'r') as zipf:
-            zip_size = os.path.getsize(filepath)
-            zip_size_str = f"{zip_size/1024:.1f} KB" if zip_size < 1024*1024 else f"{zip_size/(1024*1024):.1f} MB"
-            print(f"Container size: {zip_size_str}")
-            print("Included files:")
-            for info in sorted(zipf.infolist(), key=lambda x: x.filename):
-                size_str = f"{info.file_size/1024:.1f} KB" if info.file_size < 1024*1024 else f"{info.file_size/(1024*1024):.1f} MB"
-                compression = (1 - info.compress_size/info.file_size) * 100 if info.file_size > 0 else 0
-                print(f"- {info.filename:<50} {size_str:>10} (compressed: {compression:.1f}%)")
+        # Verify ZIP in debug mode only
+        if settings.debug_mode:
+            print("\nVerifying ARF container contents:")
+            with zipfile.ZipFile(filepath, 'r') as zipf:
+                zip_size = os.path.getsize(filepath)
+                zip_size_str = f"{zip_size/1024:.1f} KB" if zip_size < 1024*1024 else f"{zip_size/(1024*1024):.1f} MB"
+                print(f"Container size: {zip_size_str}")
+                print("Included files:")
+                for info in sorted(zipf.infolist(), key=lambda x: x.filename):
+                    size_str = f"{info.file_size/1024:.1f} KB" if info.file_size < 1024*1024 else f"{info.file_size/(1024*1024):.1f} MB"
+                    compression = (1 - info.compress_size/info.file_size) * 100 if info.file_size > 0 else 0
+                    print(f"- {info.filename:<50} {size_str:>10} (compressed: {compression:.1f}%)")  
+        else:
+            # Just verify the file exists
+            with zipfile.ZipFile(filepath, 'r') as zipf:
+                pass
 
             # Extra verification - check that ALL exported files made it into the ZIP
             zip_files = set(zipf.namelist())
@@ -1916,9 +2035,9 @@ def export_arf_zip(context, filepath, settings):
                 for missing in missing_files:
                     print(f"  - {missing}")
 
-        print(f"\nARF export completed successfully!")
-        print(f"Output: {os.path.abspath(filepath)}")
-        print("=" * 50)
+        # Simple completion message
+        zip_size = os.path.getsize(filepath) / (1024 * 1024)
+        print(f"\n✓ Export complete: {os.path.basename(filepath)} ({zip_size:.1f} MB)")
         
     except Exception as e:
         print(f"\nERROR during export: {str(e)}")
@@ -1935,12 +2054,12 @@ def export_arf_zip(context, filepath, settings):
                     try:
                         os.remove(os.path.join(root, file))
                     except Exception as e:
-                        print(f"WARNING: Could not remove file {file}: {str(e)}")
+                        debug_print(settings, f"WARNING: Could not remove file {file}: {str(e)}")
                 for dir in dirs:
                     try:
                         os.rmdir(os.path.join(root, dir))
                     except Exception as e:
-                        print(f"WARNING: Could not remove directory {dir}: {str(e)}")
+                        debug_print(settings, f"WARNING: Could not remove directory {dir}: {str(e)}")
             try:
                 os.rmdir(temp_dir)
             except Exception as e:
@@ -2017,11 +2136,7 @@ class ExportARF(bpy.types.Operator, ExportHelper):
         max=0.9
     )
     
-    crop_textures: BoolProperty(
-        name="Crop Textures",
-        description="Crop textures based on UV usage to reduce file size",
-        default=True
-    )
+    # Removed crop_textures - always use external textures without cropping
 
     optimize_mesh: BoolProperty(
         name="Optimize Mesh",
@@ -2148,7 +2263,7 @@ class ExportARF(bpy.types.Operator, ExportHelper):
             settings.optimize_mesh = self.optimize_mesh
             settings.apply_modifiers = self.apply_modifiers
             settings.debug_mode = self.debug_mode
-            settings.crop_textures = self.crop_textures and TEXTURE_CROPPING_AVAILABLE
+            # Removed crop_textures - always use external textures without cropping
             
             # Tensor settings
             settings.use_tensor_weights = self.use_tensor_weights
@@ -2271,7 +2386,7 @@ if __name__ == "__main__":
             parser.add_argument('--no-animations', action='store_true', help='Skip animation export')
             parser.add_argument('--no-blendshapes', action='store_true', help='Skip blendshape export')
             parser.add_argument('--no-textures', action='store_true', help='Skip texture export')
-            parser.add_argument('--no-lods', action='store_true', help='Skip LOD generation')
+            parser.add_argument('--lods', action='store_true', help='Enable LOD generation (disabled by default)')
             parser.add_argument('--debug', action='store_true', help='Enable debug mode')
             
             return parser.parse_args(args)
@@ -2279,20 +2394,23 @@ if __name__ == "__main__":
         # Parse arguments
         args = parse_args()
         
-        print("=" * 70)
-        print("ARF Exporter - Fixed Version with Custom GLB Export")
-        print("=" * 70)
-        print(f"Output file: {args.output}")
-        print(f"Scale: {args.scale}")
-        print("✓ Custom GLB exporter loaded - mesh isolation enabled")
-        print()
+        # Minimal output in non-debug mode
+        if args.debug:
+            print("=" * 70)
+            print("ARF Exporter - Fixed Version with Custom GLB Export")
+            print("=" * 70)
+            print(f"Output file: {args.output}")
+            print(f"Scale: {args.scale}")
+            print("✓ Custom GLB exporter loaded - mesh isolation enabled")
+            print()
         
         # Ensure we have an absolute path
         output_path = os.path.abspath(args.output)
         
         # Select all mesh objects and armatures if nothing is selected
         if not bpy.context.selected_objects:
-            print("No objects selected, selecting all mesh objects and armatures...")
+            if args.debug:
+                print("No objects selected, selecting all mesh objects and armatures...")
             bpy.ops.object.select_all(action='DESELECT')
             for obj in bpy.context.scene.objects:
                 if obj.type in ['MESH', 'ARMATURE']:
@@ -2302,8 +2420,9 @@ if __name__ == "__main__":
             if bpy.context.selected_objects:
                 bpy.context.view_layer.objects.active = bpy.context.selected_objects[0]
         
-        print(f"Selected {len(bpy.context.selected_objects)} objects for export")
-        print()
+        if args.debug:
+            print(f"Selected {len(bpy.context.selected_objects)} objects for export")
+            print()
         
         # Execute the export
         try:
@@ -2313,21 +2432,13 @@ if __name__ == "__main__":
                 export_animations=not args.no_animations,
                 export_blendshapes=not args.no_blendshapes,
                 export_textures=not args.no_textures,
-                export_lods=not args.no_lods,
+                export_lods=args.lods,
                 debug_mode=args.debug
             )
             
             if result == {'FINISHED'}:
-                print()
-                print("=" * 70)
-                print("✅ Export completed successfully!")
-                print(f"Output file: {output_path}")
-                
-                # Get file info
-                if os.path.exists(output_path):
-                    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                    print(f"File size: {size_mb:.1f} MB")
-                print("=" * 70)
+                # Already shows completion message in export_arf_zip
+                pass
             else:
                 print("❌ Export failed!")
                 sys.exit(1)

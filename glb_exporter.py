@@ -1,236 +1,98 @@
 #!/usr/bin/env python3
 """
-Simplified Blender mesh to GLB converter without external dependencies.
-Uses only Blender's built-in modules.
+Consolidated GLB exporter with external texture support.
+Always exports textures as external files for reuse.
 """
 
 import bpy
 import struct
 import json
 import numpy as np
-import base64
 import os
-import tempfile
 from io import BytesIO
 from typing import Dict, List, Any, Optional, Tuple
 
-# Import texture cropping modules
-TEXTURE_CROPPING_AVAILABLE = False
-try:
-    try:
-        from .texture_cropper import TextureCropper, UVBoundsCalculator
-    except ImportError:
-        # When run directly
-        from texture_cropper import TextureCropper, UVBoundsCalculator
-    TEXTURE_CROPPING_AVAILABLE = True
-except ImportError as e:
-    # Texture cropping not available (probably missing PIL)
-    print(f"Warning: Texture cropping not available: {e}")
-    TextureCropper = None
-    UVBoundsCalculator = None
+# Import utilities
+from uv_utils import convert_blender_uv_to_gltf
+from external_texture_manager import ExternalTextureManager
 
-def convert_blender_to_gltf_coords(pos):
-    """Convert from Blender's Z-up to glTF's Y-up coordinate system.
-    Blender: X-right, Y-forward, Z-up
-    glTF: X-right, Y-up, Z-forward
-    """
-    if len(pos) == 3:
-        # Swap Y and Z coordinates
-        return [pos[0], pos[2], -pos[1]]
-    return pos
-
-def convert_blender_to_gltf_normal(normal):
-    """Convert normal vectors from Blender to glTF coordinate system."""
-    if len(normal) == 3:
-        # Swap Y and Z components  
-        return [normal[0], normal[2], -normal[1]]
-    return normal
-
-def extract_texture_from_node(node, input_name):
-    """Extract texture information from a node input if connected to an image texture."""
-    if not node or input_name not in node.inputs:
-        return None
-        
-    socket = node.inputs[input_name]
-    if not socket.is_linked:
-        return None
-        
-    # Follow links to find image texture node
-    for link in socket.links:
-        from_node = link.from_node
-        if from_node.type == 'TEX_IMAGE' and from_node.image:
-            return from_node.image
-        # Could also handle other node types here if needed
-    
-    return None
-
-def encode_image_to_buffer(image):
-    """Encode a Blender image to bytes for embedding in GLB."""
-    try:
-        # Method 1: If image has a filepath and it exists, read it directly
-        if image.filepath and os.path.exists(bpy.path.abspath(image.filepath)):
-            filepath = bpy.path.abspath(image.filepath)
-            with open(filepath, 'rb') as f:
-                image_data = f.read()
-            
-            # Determine MIME type from file extension
-            ext = os.path.splitext(filepath)[1].lower()
-            mime_type = {
-                '.png': 'image/png',
-                '.jpg': 'image/jpeg', 
-                '.jpeg': 'image/jpeg',
-                '.webp': 'image/webp'
-            }.get(ext, 'image/png')
-            
-            print(f"Loaded texture {image.name} from file: {filepath}")
-            return image_data, mime_type
-            
-        # Method 2: If image is packed in blend file
-        if image.packed_file:
-            image_data = image.packed_file.data
-            # Try to determine format from image settings
-            format = image.file_format if hasattr(image, 'file_format') else 'PNG'
-            mime_type = f"image/{format.lower()}" if format != 'JPEG' else "image/jpeg"
-            print(f"Loaded packed texture {image.name}")
-            return image_data, mime_type
-            
-        # Method 3: Force load and encode from pixel data
-        print(f"Encoding texture {image.name} from pixel data")
-        
-        # Don't use gl_load in background mode - it crashes without OpenGL context
-        if not bpy.app.background:
-            try:
-                if hasattr(image, 'gl_load'):
-                    image.gl_load()
-            except Exception as e:
-                print(f"Warning: Could not load image {image.name} data: {e}")
-        
-        # Get image dimensions
-        width = image.size[0]
-        height = image.size[1]
-        
-        if width == 0 or height == 0:
-            print(f"Image {image.name} has invalid dimensions: {width}x{height}")
-            return None, None
-            
-        # Get pixel data as a flat array [r,g,b,a,r,g,b,a,...]
-        pixels = np.array(image.pixels[:])
-        
-        if len(pixels) == 0:
-            print(f"Image {image.name} has no pixel data")
-            return None, None
-            
-        # Reshape to [height, width, 4]
-        pixels = pixels.reshape((height, width, 4))
-        
-        # Flip vertically (Blender has origin at bottom-left, most formats at top-left)
-        pixels = np.flipud(pixels)
-        
-        # Convert to uint8
-        pixels_uint8 = (pixels * 255).astype(np.uint8)
-        
-        # Encode as PNG
-        from io import BytesIO
-        try:
-            from PIL import Image as PILImage
-            pil_image = PILImage.fromarray(pixels_uint8, 'RGBA')
-            buffer = BytesIO()
-            pil_image.save(buffer, format='PNG', optimize=True)
-            buffer.seek(0)
-            return buffer.getvalue(), "image/png"
-        except ImportError:
-            print("PIL not available, trying alternative method")
-            # Try using Blender's save_render
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                temp_path = temp_file.name
-            
-            scene = bpy.context.scene
-            old_format = scene.render.image_settings.file_format
-            old_quality = scene.render.image_settings.quality
-            
-            try:
-                scene.render.image_settings.file_format = 'PNG'
-                image.save_render(temp_path)
-                
-                with open(temp_path, 'rb') as f:
-                    image_data = f.read()
-                
-                os.unlink(temp_path)
-                return image_data, "image/png"
-            finally:
-                scene.render.image_settings.file_format = old_format
-                scene.render.image_settings.quality = old_quality
-                
-    except Exception as e:
-        print(f"Failed to encode image {image.name}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return None, None
-
-def convert_blender_to_gltf_quaternion(quat):
-    """Convert quaternion from Blender to glTF coordinate system.
-    Blender uses WXYZ, glTF uses XYZW order."""
-    if len(quat) == 4:
-        # First reorder from WXYZ to XYZW if needed
-        # Then apply axis swap for coordinate system
-        # The quaternion needs to be adjusted for the axis swap
-        x, y, z, w = quat[1], quat[2], quat[3], quat[0]
-        # Swap Y and Z, negate the appropriate component
-        return [x, z, -y, w]
-    return quat
 
 def convert_blender_to_gltf_matrix(matrix):
-    """Convert a 4x4 matrix from Blender to glTF coordinate system."""
-    # Create conversion matrix (swap Y and Z axes)
+    """Convert Blender's coordinate system to glTF."""
+    # Blender: Z-up, Y-forward, X-right
+    # glTF: Y-up, Z-forward, X-right
     conversion = np.array([
         [1, 0, 0, 0],
         [0, 0, 1, 0],
         [0, -1, 0, 0],
         [0, 0, 0, 1]
     ])
+    return conversion @ matrix @ conversion.T
+
+
+def convert_blender_to_gltf_coords(coords):
+    """Convert Blender coordinates to glTF coordinates."""
+    return [coords[0], coords[2], -coords[1]]
+
+
+def convert_blender_to_gltf_normal(normal):
+    """Convert Blender normal to glTF normal."""
+    return [normal[0], normal[2], -normal[1]]
+
+
+def convert_blender_to_gltf_quaternion(q):
+    """Convert Blender quaternion to glTF quaternion."""
+    # Blender: W, X, Y, Z
+    # glTF: X, Y, Z, W
+    # Also need coordinate system conversion
+    return [q[1], q[3], -q[2], q[0]]
+
+
+def extract_texture_from_node(node, socket_name):
+    """Extract texture from a shader node socket."""
+    if socket_name in node.inputs:
+        socket = node.inputs[socket_name]
+        if socket.is_linked:
+            for link in socket.links:
+                from_node = link.from_node
+                if from_node.type == 'TEX_IMAGE' and from_node.image:
+                    return from_node.image
+    return None
+
+
+def encode_image_to_buffer(image):
+    """Encode a Blender image to bytes."""
+    if not image:
+        return None, None
+        
+    # Handle packed files
+    if image.packed_file:
+        return image.packed_file.data, 'image/png'
     
-    # Convert matrix to numpy array if needed
-    if hasattr(matrix, 'to_4x4'):
-        mat = np.array(matrix.to_4x4())
-    else:
-        mat = np.array(matrix).reshape(4, 4)
+    # Handle external files
+    filepath = bpy.path.abspath(image.filepath)
+    if os.path.exists(filepath):
+        with open(filepath, 'rb') as f:
+            image_data = f.read()
+        
+        # Determine MIME type
+        ext = os.path.splitext(filepath)[1].lower()
+        mime_type = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.webp': 'image/webp'
+        }.get(ext, 'image/png')
+        
+        return image_data, mime_type
     
-    # Apply conversion: glTF_matrix = conversion @ blender_matrix @ conversion.T
-    result = conversion @ mat @ conversion.T
-    return result.flatten().tolist()
+    return None, None
 
 
 class SimpleGLBGenerator:
-    """Simplified GLB generator using only built-in modules."""
+    """Simplified GLB generator with external texture support."""
     
-    # glTF constants
-    GLTF_MAGIC = 0x46546C67  # ASCII string 'glTF'
-    GLTF_VERSION = 2
-    JSON_CHUNK_TYPE = 0x4E4F534A  # ASCII string 'JSON'
-    BIN_CHUNK_TYPE = 0x004E4942   # ASCII string 'BIN\0'
-    
-    # Component types
-    COMPONENT_TYPES = {
-        'int8': 5120,
-        'uint8': 5121,
-        'int16': 5122,
-        'uint16': 5123,
-        'uint32': 5125,
-        'float32': 5126,
-    }
-    
-    # Type strings
-    TYPE_STRINGS = {
-        1: "SCALAR",
-        2: "VEC2",
-        3: "VEC3",
-        4: "VEC4",
-        9: "MAT3",
-        16: "MAT4"
-    }
-    
-    def __init__(self):
+    def __init__(self, texture_manager: ExternalTextureManager):
         self.buffer_data = BytesIO()
         self.accessors = []
         self.buffer_views = []
@@ -238,28 +100,107 @@ class SimpleGLBGenerator:
         self.textures = []
         self.images = []
         self.samplers = []
+        self.texture_manager = texture_manager
         
-    def create_glb(self, mesh_data: Dict[str, Any], materials_data: Optional[List[Dict[str, Any]]] = None) -> bytes:
+    def add_accessor(self, buffer_view_idx, byte_offset, component_type, count, accessor_type, min_vals=None, max_vals=None):
+        """Add an accessor to the glTF."""
+        accessor = {
+            "bufferView": buffer_view_idx,
+            "byteOffset": byte_offset,
+            "componentType": component_type,
+            "count": count,
+            "type": accessor_type
+        }
+        
+        if min_vals is not None:
+            accessor["min"] = min_vals
+        if max_vals is not None:
+            accessor["max"] = max_vals
+            
+        self.accessors.append(accessor)
+        return len(self.accessors) - 1
+        
+    def add_buffer_view(self, byte_offset, byte_length, target=None):
+        """Add a buffer view to the glTF."""
+        view = {
+            "buffer": 0,
+            "byteOffset": byte_offset,
+            "byteLength": byte_length
+        }
+        if target is not None:
+            view["target"] = target
+            
+        self.buffer_views.append(view)
+        return len(self.buffer_views) - 1
+        
+    def add_primitive_data(self, data, component_type, accessor_type, target=None):
+        """Add primitive data (vertices, normals, etc.) to the buffer."""
+        # Ensure proper alignment
+        padding = (4 - (self.buffer_data.tell() % 4)) % 4
+        if padding:
+            self.buffer_data.write(b'\x00' * padding)
+            
+        byte_offset = self.buffer_data.tell()
+        data_bytes = data.tobytes()
+        self.buffer_data.write(data_bytes)
+        
+        # Create buffer view
+        buffer_view_idx = self.add_buffer_view(byte_offset, len(data_bytes), target)
+        
+        # Calculate min/max for position data
+        min_vals = None
+        max_vals = None
+        if accessor_type == "VEC3" and data.shape[1] == 3:
+            min_vals = data.min(axis=0).tolist()
+            max_vals = data.max(axis=0).tolist()
+            
+        # Create accessor
+        accessor_idx = self.add_accessor(
+            buffer_view_idx, 0, component_type,
+            len(data), accessor_type, min_vals, max_vals
+        )
+        
+        return accessor_idx
+        
+    def add_external_texture(self, image_data: bytes, image_name: str, mime_type: str, asset_name: str = None) -> int:
+        """Add texture as external file and return texture index."""
+        # Get external texture URI
+        filename, relative_uri = self.texture_manager.register_texture(image_data, image_name, mime_type, asset_name)
+        
+        # Create texture entry
+        texture_idx = len(self.textures)
+        self.textures.append({
+            'source': len(self.images),
+            'sampler': 0
+        })
+        
+        # Create image entry with URI
+        self.images.append({
+            'name': image_name,
+            'uri': relative_uri,
+            'mimeType': mime_type
+        })
+        
+        # Ensure default sampler exists
+        if not self.samplers:
+            self.samplers.append({
+                'magFilter': 9729,  # LINEAR
+                'minFilter': 9987,  # LINEAR_MIPMAP_LINEAR
+                'wrapS': 10497,     # REPEAT
+                'wrapT': 10497      # REPEAT
+            })
+        
+        return texture_idx
+        
+    def create_glb(self, mesh_data: Dict[str, Any], materials_data: List[Dict[str, Any]]) -> bytes:
         """Create a GLB file from mesh data."""
-        # Preserve existing buffer data if textures were already added
-        existing_buffer_size = self.buffer_data.tell() if hasattr(self, 'buffer_data') else 0
-        
-        # Only reset accessors and buffer views for mesh data
-        # Keep existing buffer data, textures, images, samplers
-        self.accessors = []
-        # Only reset buffer views that are for mesh data (not texture data)
-        if existing_buffer_size == 0:
-            self.buffer_views = []
-        # else keep existing buffer views for textures
-        
         self.materials = materials_data or []
-        # Don't reset textures, images, samplers - they may have been populated already
         
         # Build glTF structure
         gltf = {
             "asset": {
                 "version": "2.0",
-                "generator": "Blender ARF Exporter Simple GLB"
+                "generator": "Blender ARF Exporter"
             },
             "scene": 0,
             "scenes": [{"nodes": [0]}],
@@ -270,52 +211,17 @@ class SimpleGLBGenerator:
             "buffers": []
         }
         
-        # Process materials if provided
+        # Add materials and textures
         if self.materials:
             gltf["materials"] = self.materials
-            print(f"GLB contains {len(self.materials)} materials")
-            
-        # Add textures, images, and samplers if any
         if self.textures:
             gltf["textures"] = self.textures
-            print(f"GLB contains {len(self.textures)} textures")
         if self.images:
             gltf["images"] = self.images
-            print(f"GLB contains {len(self.images)} images")
         if self.samplers:
             gltf["samplers"] = self.samplers
-            print(f"GLB contains {len(self.samplers)} samplers")
         
         # Process mesh
-        mesh_json = self._process_mesh(mesh_data)
-        
-        # Only add mesh if it has valid primitives
-        if mesh_json["primitives"]:
-            gltf["meshes"].append(mesh_json)
-        else:
-            # Create a minimal valid mesh with a single triangle
-            self._create_minimal_mesh(gltf)
-        
-        # Add accessors and buffer views
-        if self.accessors:
-            gltf["accessors"] = self.accessors
-        if self.buffer_views:
-            gltf["bufferViews"] = self.buffer_views
-        
-        # Add buffer
-        buffer_length = self.buffer_data.tell()
-        if buffer_length > 0:
-            gltf["buffers"] = [{"byteLength": buffer_length}]
-        else:
-            # Add a minimal buffer
-            self.buffer_data.write(b'\x00' * 4)
-            gltf["buffers"] = [{"byteLength": 4}]
-        
-        # Create GLB
-        return self._create_glb_binary(gltf, self.buffer_data.getvalue())
-    
-    def _process_mesh(self, mesh_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Process mesh data and create glTF mesh object."""
         mesh_json = {
             "name": mesh_data.get('name', 'mesh'),
             "primitives": []
@@ -323,147 +229,58 @@ class SimpleGLBGenerator:
         
         for primitive in mesh_data.get('primitives', []):
             prim_json = self._process_primitive(primitive)
-            if prim_json is not None:
+            if prim_json:
                 mesh_json["primitives"].append(prim_json)
         
-        return mesh_json
-    
-    def _process_primitive(self, primitive: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        gltf["meshes"].append(mesh_json)
+        
+        # Add accessors and buffer views
+        gltf["accessors"] = self.accessors
+        gltf["bufferViews"] = self.buffer_views
+        
+        # Add buffer
+        buffer_length = self.buffer_data.tell()
+        gltf["buffers"] = [{"byteLength": buffer_length}]
+        
+        # Create GLB
+        return self._create_glb_binary(gltf, self.buffer_data.getvalue())
+        
+    def _process_primitive(self, primitive: Dict[str, Any]) -> Dict[str, Any]:
         """Process a single primitive."""
         prim_json = {
             "attributes": {},
-            "mode": primitive.get('mode', 4)  # Default to TRIANGLES
-        }
-        
-        # Process attributes
-        has_attributes = False
-        for attr_name, data in primitive.get('attributes', {}).items():
-            if isinstance(data, np.ndarray):
-                accessor_idx = self._add_accessor(data, attr_name)
-                prim_json["attributes"][attr_name] = accessor_idx
-                has_attributes = True
-        
-        # Skip primitive if it has no attributes
-        if not has_attributes:
-            return None
-        
-        # Process indices
-        indices = primitive.get('indices')
-        if indices is not None and isinstance(indices, np.ndarray):
-            accessor_idx = self._add_accessor(indices, 'INDICES')
-            prim_json["indices"] = accessor_idx
-        
-        # Add material if present
-        if 'material' in primitive and primitive['material'] is not None:
-            prim_json["material"] = primitive['material'] % len(self.materials) if self.materials else 0
-        
-        return prim_json
-    
-    def _add_accessor(self, data: np.ndarray, attribute_type: str) -> int:
-        """Add accessor for numpy array data."""
-        # Ensure data is C-contiguous
-        if not data.flags['C_CONTIGUOUS']:
-            data = np.ascontiguousarray(data)
-            
-        # Ensure buffer is aligned to 4 bytes before adding data
-        padding = (4 - (self.buffer_data.tell() % 4)) % 4
-        if padding:
-            self.buffer_data.write(b'\x00' * padding)
-        
-        # Determine component type
-        dtype_map = {
-            np.dtype(np.int8): 5120,
-            np.dtype(np.uint8): 5121,
-            np.dtype(np.int16): 5122,
-            np.dtype(np.uint16): 5123,
-            np.dtype(np.uint32): 5125,
-            np.dtype(np.float32): 5126,
-        }
-        component_type = dtype_map.get(data.dtype, 5126)  # Default to FLOAT
-        
-        # Determine type string
-        if data.ndim == 1:
-            count = data.shape[0]
-            type_str = "SCALAR"
-        else:
-            count = data.shape[0]
-            num_components = data.shape[1]
-            type_str = self.TYPE_STRINGS.get(num_components, "SCALAR")
-        
-        # Calculate min/max for certain attributes
-        accessor = {
-            "bufferView": len(self.buffer_views),
-            "componentType": component_type,
-            "count": count,
-            "type": type_str
-        }
-        
-        # Add min/max for position
-        if attribute_type == "POSITION" and data.ndim == 2 and data.shape[1] == 3:
-            accessor["min"] = data.min(axis=0).tolist()
-            accessor["max"] = data.max(axis=0).tolist()
-        
-        # Create buffer view
-        byte_offset = self.buffer_data.tell()
-        byte_length = data.nbytes
-        
-        buffer_view = {
-            "buffer": 0,
-            "byteOffset": byte_offset,
-            "byteLength": byte_length
-        }
-        
-        # Add target for vertex attributes
-        if attribute_type in ["POSITION", "NORMAL", "TANGENT", "TEXCOORD_0", "TEXCOORD_1", "COLOR_0", "JOINTS_0", "WEIGHTS_0"]:
-            buffer_view["target"] = 34962  # ARRAY_BUFFER
-        elif attribute_type == "INDICES":
-            buffer_view["target"] = 34963  # ELEMENT_ARRAY_BUFFER
-        
-        # Write data to buffer
-        self.buffer_data.write(data.tobytes())
-        
-        # Align to 4-byte boundary
-        padding = (4 - (self.buffer_data.tell() % 4)) % 4
-        if padding:
-            self.buffer_data.write(b'\x00' * padding)
-        
-        # Add to lists
-        self.buffer_views.append(buffer_view)
-        self.accessors.append(accessor)
-        
-        return len(self.accessors) - 1
-    
-    def _create_minimal_mesh(self, gltf: Dict[str, Any]):
-        """Create a minimal valid mesh with a single triangle."""
-        # Create a simple triangle
-        positions = np.array([
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0]
-        ], dtype=np.float32)
-        
-        # Add position accessor
-        pos_accessor_idx = self._add_accessor(positions, 'POSITION')
-        
-        # Create primitive
-        primitive = {
-            "attributes": {
-                "POSITION": pos_accessor_idx
-            },
             "mode": 4  # TRIANGLES
         }
         
-        # Create mesh
-        mesh = {
-            "name": "minimal_mesh",
-            "primitives": [primitive]
-        }
+        # Process attributes
+        for attr_name, data in primitive.get('attributes', {}).items():
+            if isinstance(data, np.ndarray):
+                component_type = 5126  # FLOAT
+                if attr_name == "POSITION":
+                    accessor_idx = self.add_primitive_data(data, component_type, "VEC3", 34962)
+                elif attr_name == "NORMAL":
+                    accessor_idx = self.add_primitive_data(data, component_type, "VEC3", 34962)
+                elif attr_name == "TEXCOORD_0":
+                    accessor_idx = self.add_primitive_data(data, component_type, "VEC2", 34962)
+                else:
+                    continue
+                prim_json["attributes"][attr_name] = accessor_idx
         
-        gltf["meshes"].append(mesh)
-    
+        # Process indices
+        indices = primitive.get('indices')
+        if isinstance(indices, np.ndarray):
+            accessor_idx = self.add_primitive_data(indices, 5125, "SCALAR", 34963)  # UNSIGNED_INT
+            prim_json["indices"] = accessor_idx
+        
+        # Add material
+        if 'material' in primitive:
+            prim_json["material"] = primitive['material']
+        
+        return prim_json
+        
     def _create_glb_binary(self, gltf: Dict[str, Any], buffer_data: bytes) -> bytes:
-        """Create binary GLB from glTF JSON and buffer data."""
-        # Convert JSON to bytes
+        """Create the final GLB binary."""
+        # Convert glTF to JSON
         json_str = json.dumps(gltf, separators=(',', ':'))
         json_bytes = json_str.encode('utf-8')
         
@@ -471,149 +288,64 @@ class SimpleGLBGenerator:
         json_padding = (4 - (len(json_bytes) % 4)) % 4
         json_bytes += b' ' * json_padding
         
+        # Pad buffer to 4-byte boundary
+        buffer_padding = (4 - (len(buffer_data) % 4)) % 4
+        buffer_data += b'\x00' * buffer_padding
+        
         # Calculate total length
-        header_length = 12
-        json_chunk_length = 8 + len(json_bytes)
-        bin_chunk_length = 8 + len(buffer_data) if buffer_data else 0
-        total_length = header_length + json_chunk_length + bin_chunk_length
+        total_length = 12 + 8 + len(json_bytes) + 8 + len(buffer_data)
         
         # Create GLB
         glb = BytesIO()
         
-        # Write header
-        glb.write(struct.pack('<III', self.GLTF_MAGIC, self.GLTF_VERSION, total_length))
+        # Header
+        glb.write(b'glTF')
+        glb.write(struct.pack('<I', 2))  # Version
+        glb.write(struct.pack('<I', total_length))
         
-        # Write JSON chunk
-        glb.write(struct.pack('<II', len(json_bytes), self.JSON_CHUNK_TYPE))
+        # JSON chunk
+        glb.write(struct.pack('<I', len(json_bytes)))
+        glb.write(struct.pack('<I', 0x4E4F534A))  # JSON
         glb.write(json_bytes)
         
-        # Write binary chunk if present
-        if buffer_data:
-            # Pad buffer to 4-byte boundary
-            buffer_padding = (4 - (len(buffer_data) % 4)) % 4
-            padded_buffer = buffer_data + b'\x00' * buffer_padding
-            
-            glb.write(struct.pack('<II', len(padded_buffer), self.BIN_CHUNK_TYPE))
-            glb.write(padded_buffer)
+        # Binary chunk
+        glb.write(struct.pack('<I', len(buffer_data)))
+        glb.write(struct.pack('<I', 0x004E4942))  # BIN
+        glb.write(buffer_data)
         
         return glb.getvalue()
 
 
-def _add_texture_to_glb(generator, image, uv_bounds=None, original_size=None):
-    """Add a texture to the GLB generator and return its index.
+def export_mesh_to_glb(mesh_obj, output_path: str, texture_manager: ExternalTextureManager, 
+                      scale: float = 1.0, asset_name: str = None, include_materials: bool = True) -> bool:
+    """
+    Export a mesh to GLB with external textures.
     
     Args:
-        generator: The GLB generator instance
-        image: Blender image object
-        uv_bounds: Optional UV bounds for cropping (min_u, min_v, max_u, max_v)
-        original_size: Original image size if texture was cropped
+        mesh_obj: Blender mesh object
+        output_path: Path for output GLB file
+        texture_manager: Manager for external texture files
+        scale: Scale factor for export
+        asset_name: Name of the asset this mesh belongs to
+        include_materials: Whether to include materials and textures (False for blendshapes)
         
     Returns:
-        Texture index or None if failed
+        bool: Success status
     """
-    if not image:
-        return None
-        
-    # Check if we already added this image
-    for i, existing_img in enumerate(generator.images):
-        if existing_img.get('name') == image.name:
-            print(f"Texture {image.name} already added at index {i}")
-            return i
-    
-    # Get image data using our improved encoder
-    image_data, mime_type = encode_image_to_buffer(image)
-    if not image_data:
-        print(f"Failed to get data for texture {image.name}")
-        return None
-    
-    # Store crop info if bounds were provided
-    crop_info = None
-    if uv_bounds is not None:
-        crop_info = {
-            'uv_bounds': uv_bounds,
-            'original_size': original_size
-        }
-        
-    print(f"Adding texture {image.name} to GLB: {len(image_data)} bytes, {mime_type}")
-    
-    # Add image to buffer - align to 4-byte boundary first
-    padding = (4 - (generator.buffer_data.tell() % 4)) % 4
-    if padding:
-        generator.buffer_data.write(b'\x00' * padding)
-        
-    buffer_offset = generator.buffer_data.tell()
-    generator.buffer_data.write(image_data)
-    buffer_length = len(image_data)
-    
-    # Create buffer view for image (before padding)
-    buffer_view_idx = len(generator.buffer_views)
-    generator.buffer_views.append({
-        "buffer": 0,
-        "byteOffset": buffer_offset,
-        "byteLength": buffer_length
-    })
-    
-    # Add image
-    image_idx = len(generator.images)
-    image_entry = {
-        "bufferView": buffer_view_idx,
-        "mimeType": mime_type,
-        "name": image.name  # Add the image name
-    }
-    if crop_info:
-        image_entry['crop_info'] = crop_info  # Store for UV remapping
-    generator.images.append(image_entry)
-    
-    # Add sampler (using default settings)
-    sampler_idx = len(generator.samplers)
-    generator.samplers.append({
-        "magFilter": 9729,  # LINEAR
-        "minFilter": 9987,  # LINEAR_MIPMAP_LINEAR  
-        "wrapS": 10497,     # REPEAT
-        "wrapT": 10497      # REPEAT
-    })
-    
-    # Add texture
-    texture_idx = len(generator.textures)
-    generator.textures.append({
-        "source": image_idx,
-        "sampler": sampler_idx,
-        "name": image.name  # Add texture name too
-    })
-    
-    print(f"Texture {image.name} added at index {texture_idx}")
-    return texture_idx
-
-def export_mesh_to_glb_simple(mesh_obj: bpy.types.Object, output_path: str, 
-                              include_skin: bool = False, 
-                              armature_obj: Optional[bpy.types.Object] = None,
-                              scale: float = 1.0,
-                              crop_textures: bool = True) -> bool:
-    """Export a single mesh object to GLB file using simple GLB generator."""
     try:
-        mesh = mesh_obj.data
+        # Removed verbose logging for export path
         
-        # Ensure mesh is in a good state for export
-        mesh.calc_loop_triangles()
-        
-        # Get the evaluated mesh (with modifiers applied)
+        # Get evaluated mesh
         depsgraph = bpy.context.evaluated_depsgraph_get()
         eval_obj = mesh_obj.evaluated_get(depsgraph)
         eval_mesh = eval_obj.data
+        eval_mesh.calc_loop_triangles()
         
-        # Build a vertex map to handle per-loop UVs properly
-        # We need unique vertices for each unique position+normal+UV combination
-        vertex_map = {}  # (vert_idx, uv_tuple) -> new_vertex_idx
-        vertices = []
-        normals = []
-        uvs = []
-        
-        # Process each triangle to build proper per-vertex data
-        material_primitives = {}  # material_idx -> primitive data
+        # Group triangles by material
+        material_primitives = {}
         
         for tri in eval_mesh.loop_triangles:
             mat_idx = tri.material_index
-            
             if mat_idx not in material_primitives:
                 material_primitives[mat_idx] = {
                     'vertices': [],
@@ -625,22 +357,23 @@ def export_mesh_to_glb_simple(mesh_obj: bpy.types.Object, output_path: str,
             
             prim_data = material_primitives[mat_idx]
             
-            # Process each vertex in the triangle
-            for i in range(3):  # Triangles have 3 vertices
+            for i in range(3):
                 loop_idx = tri.loops[i]
                 vert_idx = eval_mesh.loops[loop_idx].vertex_index
                 vert = eval_mesh.vertices[vert_idx]
                 
-                # Get UV for this loop
+                # Get UV coordinates
                 uv = [0.0, 0.0]
                 if eval_mesh.uv_layers.active:
-                    uv = list(eval_mesh.uv_layers.active.data[loop_idx].uv)
+                    raw_uv = eval_mesh.uv_layers.active.data[loop_idx].uv
+                    # Convert from Blender UV to glTF UV coordinate system
+                    u, v = convert_blender_uv_to_gltf(raw_uv[0], raw_uv[1])
+                    uv = [u, v]
                 
                 # Create unique vertex key
                 vert_key = (vert_idx, tuple(uv))
                 
                 if vert_key not in prim_data['vertex_map']:
-                    # Add new vertex
                     new_idx = len(prim_data['vertices'])
                     prim_data['vertex_map'][vert_key] = new_idx
                     
@@ -655,319 +388,240 @@ def export_mesh_to_glb_simple(mesh_obj: bpy.types.Object, output_path: str,
                 
                 prim_data['indices'].append(prim_data['vertex_map'][vert_key])
         
-        # Create primitives list with proper structure for texture cropping
-        primitives = []
-        for mat_idx, prim_data in sorted(material_primitives.items()):
-            if prim_data['vertices']:  # Only add if has vertices
-                primitive = {
-                    'attributes': {
-                        'POSITION': np.array(prim_data['vertices'], dtype=np.float32),
-                        'NORMAL': np.array(prim_data['normals'], dtype=np.float32),
-                        'TEXCOORD_0': np.array(prim_data['uvs'], dtype=np.float32)
-                    },
-                    'indices': np.array(prim_data['indices'], dtype=np.uint32),
-                    'material': mat_idx
-                }
-                primitives.append(primitive)
+        # Create GLB generator
+        generator = SimpleGLBGenerator(texture_manager)
         
-        # Create mesh data
-        mesh_data = {
-            'name': mesh_obj.name,
-            'primitives': primitives
-        }
-        
-        # Create GLB generator first
-        generator = SimpleGLBGenerator()
-        
-        # Extract material data from mesh
+        # Process materials only if requested
         materials_data = []
-        material_indices = {}
-        
-        # Collect materials from mesh
-        for idx, mat_slot in enumerate(mesh_obj.material_slots):
-            if mat_slot.material:
-                mat = mat_slot.material
-                material_indices[mat.name] = idx
-                
-                # Extract PBR material properties
+        if include_materials:
+            for idx, mat_slot in enumerate(mesh_obj.material_slots):
                 mat_data = {
-                    'name': mat.name,
-                    'pbrMetallicRoughness': {},
+                    'name': mat_slot.material.name if mat_slot.material else f"Material_{idx}",
+                    'pbrMetallicRoughness': {
+                        'baseColorFactor': [1.0, 1.0, 1.0, 1.0],
+                        'metallicFactor': 0.0,
+                        'roughnessFactor': 1.0
+                    },
                     'alphaMode': 'OPAQUE',
                     'doubleSided': True
                 }
                 
-                # Get base color and textures
-                if mat.use_nodes:
-                    # Try to find Principled BSDF node
-                    for node in mat.node_tree.nodes:
+                if mat_slot.material and mat_slot.material.use_nodes:
+                    # Find principled BSDF node
+                    for node in mat_slot.material.node_tree.nodes:
                         if node.type == 'BSDF_PRINCIPLED':
-                            # Check for base color texture
-                            base_color_image = extract_texture_from_node(node, 'Base Color')
-                            if base_color_image:
-                                print(f"Found base color texture: {base_color_image.name}")
-                                tex_idx = _add_texture_to_glb(generator, base_color_image)
-                                if tex_idx is not None:
-                                    mat_data['pbrMetallicRoughness']['baseColorTexture'] = {
-                                        'index': tex_idx,
-                                        'texCoord': 0  # Use first UV set
-                                    }
-                                    print(f"Added base color texture at index {tex_idx}")
-                                else:
-                                    print(f"Failed to add base color texture {base_color_image.name}")
-                            
-                            # Base color factor (used as multiplier if texture exists)
+                            # Base color
                             base_color = node.inputs['Base Color'].default_value
                             mat_data['pbrMetallicRoughness']['baseColorFactor'] = [
                                 base_color[0], base_color[1], base_color[2], base_color[3]
                             ]
                             
-                            # Check for metallic/roughness texture
-                            metallic_image = extract_texture_from_node(node, 'Metallic')
-                            roughness_image = extract_texture_from_node(node, 'Roughness')
-                            if metallic_image or roughness_image:
-                                # Use whichever texture we find
-                                mr_image = metallic_image or roughness_image
-                                tex_idx = _add_texture_to_glb(generator, mr_image)
-                                if tex_idx is not None:
-                                    mat_data['pbrMetallicRoughness']['metallicRoughnessTexture'] = {
+                            # Base color texture
+                            base_color_image = extract_texture_from_node(node, 'Base Color')
+                            if base_color_image:
+                                image_data, mime_type = encode_image_to_buffer(base_color_image)
+                                if image_data:
+                                    tex_idx = generator.add_external_texture(
+                                        image_data, base_color_image.name, mime_type, asset_name
+                                    )
+                                    mat_data['pbrMetallicRoughness']['baseColorTexture'] = {
                                         'index': tex_idx,
                                         'texCoord': 0
                                     }
                             
-                            # Metallic and roughness factors
+                            # Metallic/Roughness
                             mat_data['pbrMetallicRoughness']['metallicFactor'] = node.inputs['Metallic'].default_value
                             mat_data['pbrMetallicRoughness']['roughnessFactor'] = node.inputs['Roughness'].default_value
-                            
-                            # Check for normal map
-                            normal_image = extract_texture_from_node(node, 'Normal')
-                            if normal_image:
-                                tex_idx = _add_texture_to_glb(generator, normal_image)
-                                if tex_idx is not None:
-                                    mat_data['normalTexture'] = {
-                                        'index': tex_idx,
-                                        'texCoord': 0,
-                                        'scale': 1.0
-                                    }
-                            
-                            # Alpha
-                            if node.inputs['Alpha'].default_value < 1.0:
-                                mat_data['alphaMode'] = 'BLEND'
                             break
-                else:
-                    # Fallback to viewport display color
-                    mat_data['pbrMetallicRoughness']['baseColorFactor'] = [
-                        mat.diffuse_color[0], mat.diffuse_color[1], 
-                        mat.diffuse_color[2], mat.diffuse_color[3]
-                    ]
-                    mat_data['pbrMetallicRoughness']['metallicFactor'] = mat.metallic
-                    mat_data['pbrMetallicRoughness']['roughnessFactor'] = mat.roughness
                 
                 materials_data.append(mat_data)
         
-        # If no materials, add default
-        if not materials_data:
-            materials_data = [{
-                'name': 'default',
-                'pbrMetallicRoughness': {
-                    'baseColorFactor': [0.8, 0.8, 0.8, 1.0],
-                    'metallicFactor': 0.0,
-                    'roughnessFactor': 1.0
+        # Create final primitives
+        final_primitives = []
+        for mat_idx, prim_data in sorted(material_primitives.items()):
+            if not prim_data['vertices']:
+                continue
+                
+            primitive = {
+                'attributes': {
+                    'POSITION': np.array(prim_data['vertices'], dtype=np.float32),
+                    'NORMAL': np.array(prim_data['normals'], dtype=np.float32),
+                    'TEXCOORD_0': np.array(prim_data['uvs'], dtype=np.float32)
                 },
-                'alphaMode': 'OPAQUE',
-                'doubleSided': True
-            }]
+                'indices': np.array(prim_data['indices'], dtype=np.uint32)
+            }
+            # Only add material reference if including materials
+            if include_materials:
+                primitive['material'] = mat_idx
+            final_primitives.append(primitive)
         
-        # Create GLB with collected materials
-        print(f"Creating GLB with {len(materials_data)} materials, {len(generator.textures)} textures")
+        # Create mesh data
+        mesh_data = {
+            'name': mesh_obj.name,
+            'primitives': final_primitives
+        }
+        
+        # Generate GLB
         glb_data = generator.create_glb(mesh_data, materials_data)
         
-        # Write to file
+        # Write GLB file
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'wb') as f:
             f.write(glb_data)
+        
+        # Export completed successfully
         
         return True
         
     except Exception as e:
-        print(f"Error exporting {mesh_obj.name} to GLB: {str(e)}")
+        print(f"Error exporting mesh {mesh_obj.name}: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
-# Also create simplified versions for skeleton and blendshape export
-def export_skeleton_to_glb_simple(armature_obj: bpy.types.Object, output_path: str, scale: float = 1.0) -> bool:
-    """Export skeleton as a simple point cloud GLB."""
-    try:
-        # Get bone positions with scale applied and coordinate conversion
-        positions = []
-        for bone in armature_obj.data.bones:
-            scaled_pos = [coord * scale for coord in bone.head_local]
-            # Convert from Blender Z-up to glTF Y-up
-            converted_pos = convert_blender_to_gltf_coords(scaled_pos)
-            positions.append(converted_pos)
-        
-        # Create mesh data
-        mesh_data = {
-            'name': f"{armature_obj.name}_skeleton",
-            'primitives': [{
-                'attributes': {
-                    'POSITION': np.array(positions, dtype=np.float32)
-                },
-                'mode': 0  # POINTS
-            }]
-        }
-        
-        # Create GLB
-        generator = SimpleGLBGenerator()
-        glb_data = generator.create_glb(mesh_data)
-        
-        # Write to file
-        with open(output_path, 'wb') as f:
-            f.write(glb_data)
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error exporting skeleton {armature_obj.name}: {str(e)}")
-        return False
-
-
-def export_blendshape_to_glb_simple(mesh_obj: bpy.types.Object, shape_key_name: str, output_path: str) -> bool:
-    """Export blendshape as delta positions."""
-    try:
-        mesh = mesh_obj.data
-        if not mesh.shape_keys or shape_key_name not in mesh.shape_keys.key_blocks:
-            return False
-        
-        # Get base and target shape
-        basis = mesh.shape_keys.key_blocks[0]
-        target = mesh.shape_keys.key_blocks[shape_key_name]
-        
-        # Calculate deltas with coordinate conversion
-        positions = []
-        for i, (basis_vert, target_vert) in enumerate(zip(basis.data, target.data)):
-            delta = target_vert.co - basis_vert.co
-            # Convert delta from Blender to glTF coordinates
-            converted_delta = convert_blender_to_gltf_coords(list(delta))
-            positions.append(converted_delta)
-        
-        # Create mesh data
-        mesh_data = {
-            'name': shape_key_name,
-            'primitives': [{
-                'attributes': {
-                    'POSITION': np.array(positions, dtype=np.float32)
-                },
-                'mode': 0  # POINTS
-            }]
-        }
-        
-        # Create GLB
-        generator = SimpleGLBGenerator()
-        glb_data = generator.create_glb(mesh_data)
-        
-        # Write to file
-        with open(output_path, 'wb') as f:
-            f.write(glb_data)
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error exporting blendshape {shape_key_name}: {str(e)}")
-        return False
-
-
-def export_mesh_with_shape_key_applied(mesh_obj: bpy.types.Object, shape_key_values: dict, output_path: str, scale: float = 1.0, include_materials: bool = True) -> bool:
-    """Export mesh with specific shape key values applied.
+def export_blendshape_to_glb_simple(mesh_obj, shape_key_name: str, output_path: str, scale: float = 1.0) -> bool:
+    """
+    Export a single shape key as a GLB file containing delta positions.
     
     Args:
-        mesh_obj: Mesh object to export
-        shape_key_values: Dictionary of shape key names to values
-        output_path: Output GLB file path
-        scale: Scale factor
-        include_materials: Whether to include materials and textures (False for blendshapes)
+        mesh_obj: Blender mesh object with shape keys
+        shape_key_name: Name of the shape key to export
+        output_path: Path for output GLB file
+        scale: Scale factor for export
+        
+    Returns:
+        bool: Success status
     """
     try:
-        # Store original shape key values
-        original_values = {}
-        if mesh_obj.data.shape_keys:
-            for key_block in mesh_obj.data.shape_keys.key_blocks:
-                original_values[key_block.name] = key_block.value
-                # Apply requested values
-                if key_block.name in shape_key_values:
-                    key_block.value = shape_key_values[key_block.name]
-                else:
-                    key_block.value = 0.0
+        # Exporting blendshape (verbose logging removed)
         
-        # Export the mesh with shape keys applied
-        if include_materials:
-            # Full export with materials (for basis mesh)
-            success = export_mesh_to_glb_simple(mesh_obj, output_path, include_skin=False, armature_obj=None, scale=scale)
-        else:
-            # Export without materials (for blendshape deltas)
-            success = export_mesh_geometry_only(mesh_obj, output_path, scale=scale)
+        # Verify shape key exists
+        if not mesh_obj.data.shape_keys:
+            print(f"No shape keys found on {mesh_obj.name}")
+            return False
+            
+        shape_keys = mesh_obj.data.shape_keys.key_blocks
+        if shape_key_name not in shape_keys:
+            print(f"Shape key '{shape_key_name}' not found on {mesh_obj.name}")
+            return False
+            
+        # Get basis and target shape keys
+        basis = shape_keys.get("Basis") or shape_keys[0]
+        target = shape_keys[shape_key_name]
         
-        # Restore original values
-        if mesh_obj.data.shape_keys:
-            for key_block in mesh_obj.data.shape_keys.key_blocks:
-                if key_block.name in original_values:
-                    key_block.value = original_values[key_block.name]
-        
-        return success
-        
-    except Exception as e:
-        print(f"Error exporting mesh with shape key: {str(e)}")
-        return False
-
-
-def export_mesh_geometry_only(mesh_obj: bpy.types.Object, output_path: str, scale: float = 1.0) -> bool:
-    """Export mesh geometry only without materials or textures (for blendshapes)."""
-    try:
-        mesh = mesh_obj.data
-        mesh.calc_loop_triangles()
-        
-        # Get the evaluated mesh (with modifiers and shape keys applied)
+        # Get evaluated mesh
         depsgraph = bpy.context.evaluated_depsgraph_get()
         eval_obj = mesh_obj.evaluated_get(depsgraph)
         eval_mesh = eval_obj.data
+        eval_mesh.calc_loop_triangles()
         
-        # Extract vertices only (no normals, UVs, or materials needed for blendshapes)
-        vertices = []
-        for vert in eval_mesh.vertices:
-            scaled_pos = [coord * scale for coord in vert.co]
-            converted_pos = convert_blender_to_gltf_coords(scaled_pos)
-            vertices.append(converted_pos)
+        # Collect vertex positions from basis and target
+        basis_positions = []
+        target_positions = []
         
-        # Get indices
-        indices = []
-        for tri in eval_mesh.loop_triangles:
-            indices.extend(tri.vertices)
+        for i, vert in enumerate(eval_mesh.vertices):
+            # Get basis position
+            basis_pos = basis.data[i].co
+            target_pos = target.data[i].co
+            
+            # Apply scale and coordinate conversion
+            basis_scaled = [coord * scale for coord in basis_pos]
+            target_scaled = [coord * scale for coord in target_pos]
+            
+            basis_converted = convert_blender_to_gltf_coords(basis_scaled)
+            target_converted = convert_blender_to_gltf_coords(target_scaled)
+            
+            basis_positions.append(basis_converted)
+            target_positions.append(target_converted)
         
-        # Create mesh data without materials
+        # Calculate deltas
+        deltas = []
+        for basis_pos, target_pos in zip(basis_positions, target_positions):
+            delta = [target_pos[i] - basis_pos[i] for i in range(3)]
+            deltas.append(delta)
+        
+        # Create a simple GLB with just the delta positions
+        generator = SimpleGLBGenerator(None)  # No texture manager needed for blendshapes
+        
+        # Add delta positions as the only attribute
+        positions_array = np.array(deltas, dtype=np.float32)
+        
+        # Create mesh data with single primitive
         mesh_data = {
-            'name': mesh_obj.name,
+            'name': f"{mesh_obj.name}_{shape_key_name}",
             'primitives': [{
                 'attributes': {
-                    'POSITION': np.array(vertices, dtype=np.float32)
+                    'POSITION': positions_array
                 },
-                'indices': np.array(indices, dtype=np.uint32),
-                'mode': 4  # TRIANGLES
+                'mode': 0  # POINTS mode since we only have positions
             }]
         }
         
-        # Create GLB without materials
-        generator = SimpleGLBGenerator()
-        glb_data = generator.create_glb(mesh_data, materials_data=None)
+        # Generate GLB without materials
+        glb_data = generator.create_glb(mesh_data, [])
         
-        # Write to file
+        # Write GLB file
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'wb') as f:
             f.write(glb_data)
         
+        # Blendshape export completed
         return True
         
     except Exception as e:
-        print(f"Error exporting geometry-only mesh: {str(e)}")
+        print(f"Error exporting blendshape {shape_key_name}: {e}")
         import traceback
         traceback.print_exc()
         return False
+
+
+def export_mesh_with_shape_key_applied(mesh_obj, shape_values: Dict[str, float], output_path: str, 
+                                      scale: float = 1.0, include_materials: bool = True) -> bool:
+    """
+    Export a mesh with specific shape key values applied.
+    
+    Args:
+        mesh_obj: Blender mesh object with shape keys
+        shape_values: Dictionary mapping shape key names to their values (0.0 to 1.0)
+        output_path: Path for output GLB file
+        scale: Scale factor for export
+        include_materials: Whether to include materials in the export
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        # Exporting mesh with shape keys applied (verbose logging removed)
+        
+        # Store original shape key values
+        original_values = {}
+        if mesh_obj.data.shape_keys:
+            for key in mesh_obj.data.shape_keys.key_blocks:
+                original_values[key.name] = key.value
+                # Apply requested values
+                if key.name in shape_values:
+                    key.value = shape_values[key.name]
+        
+        try:
+            # Create a temporary texture manager if materials are included
+            texture_manager = ExternalTextureManager(os.path.dirname(output_path)) if include_materials else None
+            
+            # Export the mesh with shape keys applied
+            success = export_mesh_to_glb(mesh_obj, output_path, texture_manager, scale, include_materials=include_materials)
+            
+            return success
+            
+        finally:
+            # Restore original shape key values
+            if mesh_obj.data.shape_keys:
+                for key_name, value in original_values.items():
+                    if key_name in mesh_obj.data.shape_keys.key_blocks:
+                        mesh_obj.data.shape_keys.key_blocks[key_name].value = value
+        
+    except Exception as e:
+        print(f"Error exporting mesh with shape keys: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
