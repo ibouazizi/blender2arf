@@ -28,6 +28,7 @@ from bpy.props import (
     StringProperty,
     BoolProperty,
     FloatProperty,
+    IntProperty,
     EnumProperty,
     CollectionProperty
 )
@@ -65,7 +66,7 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 # Import custom GLB exporter
-from blender_to_glb_simple import (
+from glb_exporter import (
     export_mesh_to_glb_simple, 
     export_skeleton_to_glb_simple,
     export_blendshape_to_glb_simple,
@@ -74,6 +75,15 @@ from blender_to_glb_simple import (
     convert_blender_to_gltf_coords,
     convert_blender_to_gltf_quaternion
 )
+
+# Import the version with texture cropping
+try:
+    # Use the updated version with power-of-2 support
+    from glb_exporter_cropped import export_mesh_to_glb_with_texture_cropping
+    TEXTURE_CROPPING_AVAILABLE = True
+except ImportError as e:
+    TEXTURE_CROPPING_AVAILABLE = False
+    print(f"Warning: Texture cropping module not available: {e}")
 # Debug point can be uncommented when needed
 # import pdb; pdb.set_trace()
 
@@ -316,6 +326,7 @@ class ARFExportSettings:
         self.export_lods = True
         self.optimize_mesh = False
         self.compress_textures = False
+        self.crop_textures = False  # Disable texture cropping by default (requires PIL)
         self.include_preview = True
         self.apply_modifiers = True
         self.folder_structure = "organized"  # "organized" or "flat"
@@ -380,7 +391,18 @@ def export_mesh_to_glb(obj, temp_dir, settings, armature=None, subfolder="meshes
         # Determine export type
         if obj.type == 'MESH':
             include_skin = armature is not None
-            success = export_mesh_to_glb_simple(obj, glb_path, include_skin=include_skin, armature_obj=armature, scale=settings.scale)
+            # Use texture cropping version if available and enabled
+            if TEXTURE_CROPPING_AVAILABLE and settings.crop_textures:
+                try:
+                    success = export_mesh_to_glb_with_texture_cropping(
+                        obj, glb_path, scale=settings.scale, crop_textures=True,
+                        include_skin=include_skin, armature_obj=armature
+                    )
+                except Exception as e:
+                    print(f"Texture cropping failed: {e}, falling back to simple export")
+                    success = export_mesh_to_glb_simple(obj, glb_path, include_skin=include_skin, armature_obj=armature, scale=settings.scale)
+            else:
+                success = export_mesh_to_glb_simple(obj, glb_path, include_skin=include_skin, armature_obj=armature, scale=settings.scale)
         elif obj.type == 'ARMATURE':
             success = export_skeleton_to_glb_simple(obj, glb_path, scale=settings.scale)
         else:
@@ -567,7 +589,17 @@ def export_skin_weights(mesh_obj, armature_obj, temp_dir, settings):
     
     try:
         # Export mesh with skinning data
-        success = export_mesh_to_glb_simple(mesh_obj, skin_path, include_skin=True, armature_obj=armature_obj)
+        if TEXTURE_CROPPING_AVAILABLE and settings.crop_textures:
+            try:
+                success = export_mesh_to_glb_with_texture_cropping(
+                    mesh_obj, skin_path, scale=settings.scale, crop_textures=True,
+                    include_skin=True, armature_obj=armature_obj
+                )
+            except Exception as e:
+                print(f"Texture cropping failed for skin: {e}, falling back to simple export")
+                success = export_mesh_to_glb_simple(mesh_obj, skin_path, include_skin=True, armature_obj=armature_obj, scale=settings.scale)
+        else:
+            success = export_mesh_to_glb_simple(mesh_obj, skin_path, include_skin=True, armature_obj=armature_obj, scale=settings.scale)
         
         if success and os.path.exists(skin_path):
             size_kb = os.path.getsize(skin_path) / 1024
@@ -932,7 +964,8 @@ def export_blendshapes(mesh_obj, temp_dir, settings):
         
         # Export with all shape keys at 0
         shape_values = {key_block.name: 0.0 for key_block in mesh_obj.data.shape_keys.key_blocks}
-        if export_mesh_with_shape_key_applied(mesh_obj, shape_values, basis_glb_path, settings.scale):
+        # Basis mesh should include materials and textures
+        if export_mesh_with_shape_key_applied(mesh_obj, shape_values, basis_glb_path, settings.scale, include_materials=True):
             exported_blendshapes.append({
                 "id": hash(f"{mesh_obj.name}_Basis") % 10000,
                 "name": "Basis",
@@ -956,7 +989,8 @@ def export_blendshapes(mesh_obj, temp_dir, settings):
             shape_values = {kb.name: 0.0 for kb in mesh_obj.data.shape_keys.key_blocks}
             shape_values[key_block.name] = 1.0
             
-            if export_mesh_with_shape_key_applied(mesh_obj, shape_values, shape_glb_path, settings.scale):
+            # Blendshapes (except basis) should NOT include materials or textures
+            if export_mesh_with_shape_key_applied(mesh_obj, shape_values, shape_glb_path, settings.scale, include_materials=False):
                 exported_blendshapes.append({
                     "id": hash(f"{mesh_obj.name}_{key_block.name}") % 10000,
                     "name": key_block.name,
@@ -1966,6 +2000,28 @@ class ExportARF(bpy.types.Operator, ExportHelper):
         description="Generate lower quality levels of detail",
         default=True
     )
+    
+    lod_count: IntProperty(
+        name="LOD Count",
+        description="Number of LOD levels to generate",
+        default=3,
+        min=1,
+        max=5
+    )
+    
+    lod_ratio: FloatProperty(
+        name="LOD Reduction Ratio",
+        description="Reduction ratio for each LOD level",
+        default=0.5,
+        min=0.1,
+        max=0.9
+    )
+    
+    crop_textures: BoolProperty(
+        name="Crop Textures",
+        description="Crop textures based on UV usage to reduce file size",
+        default=True
+    )
 
     optimize_mesh: BoolProperty(
         name="Optimize Mesh",
@@ -2087,9 +2143,12 @@ class ExportARF(bpy.types.Operator, ExportHelper):
             settings.export_skeletons = self.export_skeletons
             settings.export_textures = self.export_textures
             settings.export_lods = self.export_lods
+            settings.lod_count = self.lod_count
+            settings.lod_ratio = self.lod_ratio
             settings.optimize_mesh = self.optimize_mesh
             settings.apply_modifiers = self.apply_modifiers
             settings.debug_mode = self.debug_mode
+            settings.crop_textures = self.crop_textures and TEXTURE_CROPPING_AVAILABLE
             
             # Tensor settings
             settings.use_tensor_weights = self.use_tensor_weights
